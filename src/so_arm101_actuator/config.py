@@ -32,6 +32,7 @@ JOINTS: dict[str, JointSpec] = {
 }
 
 HOME_POSE_RAD: dict[str, float] = {name: 0.0 for name in JOINTS}
+HOME_POSE_RAD["shoulder_lift"] = 0.10  # gravity-load on Bob; mechanical floor ~tick 2107 (calibrated 2026-05-09)
 
 MOVE_TOLERANCE_RAD: float = 0.02   # ≈ 1.15°
 
