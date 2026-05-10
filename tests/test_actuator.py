@@ -13,10 +13,23 @@ from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
 def _make_actuator(present_positions: dict[int, int] | None = None) -> tuple[SOArm101Actuator, MagicMock]:
     """Build an actuator with a MagicMock SCSProtocol.
 
-    `present_positions` maps motor_id → ticks for read_position calls.
+    `present_positions` seeds initial motor_id → ticks readings. Each
+    set_position(motor_id, ticks) call updates the simulated state, so a
+    subsequent read_position(motor_id) returns the most-recently-commanded
+    value — modeling a perfect servo and keeping the mock robust to
+    HOME_POSE_RAD changes.
     """
     proto = MagicMock()
-    proto.read_position.side_effect = lambda motor_id: (present_positions or {}).get(motor_id, 2048)
+    state: dict[int, int] = dict(present_positions or {})
+
+    def fake_set_position(motor_id: int, ticks: int) -> None:
+        state[motor_id] = ticks
+
+    def fake_read_position(motor_id: int) -> int:
+        return state.get(motor_id, 2048)
+
+    proto.set_position.side_effect = fake_set_position
+    proto.read_position.side_effect = fake_read_position
     proto.read_temperature.return_value = 30
     actuator = SOArm101Actuator(protocol=proto)
     return actuator, proto
