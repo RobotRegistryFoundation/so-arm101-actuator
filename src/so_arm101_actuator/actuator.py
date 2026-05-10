@@ -46,6 +46,7 @@ class SOArm101Actuator:
         protocol=None,  # noqa: ANN001 — duck-typed
         *,
         home_pose_rad: dict[str, float] | None = None,
+        move_tolerance_rad: float | None = None,
     ) -> None:
         """Create an actuator.
 
@@ -58,12 +59,22 @@ class SOArm101Actuator:
                 default home pose (from environment SO_ARM101_HOME_POSE_RAD or
                 config.HOME_POSE_RAD). Partial dicts merge with defaults,
                 with this kwarg taking precedence per joint.
+            move_tolerance_rad: Optional float to override the default move
+                tolerance (from environment SO_ARM101_MOVE_TOLERANCE_RAD or
+                config.MOVE_TOLERANCE_RAD). Kwarg takes precedence over env.
         """
         env_pose = config.resolve_home_pose_rad()
         if home_pose_rad is not None:
             # kwarg merges on top of env-resolved pose (kwarg wins per joint)
             env_pose = {**env_pose, **home_pose_rad}
         self.home_pose_rad: dict[str, float] = env_pose
+
+        env_tolerance = config.resolve_move_tolerance_rad()
+        if move_tolerance_rad is not None:
+            self.move_tolerance_rad: float = move_tolerance_rad
+        else:
+            self.move_tolerance_rad = env_tolerance
+
         self._protocol = protocol
 
     @classmethod
@@ -110,7 +121,7 @@ class SOArm101Actuator:
         reached = False
         while time.monotonic() - start < timeout_s:
             current = {j: self._read_joint(j) for j in joint_positions}
-            if all(abs(current[j] - joint_positions[j]) <= config.MOVE_TOLERANCE_RAD for j in joint_positions):
+            if all(abs(current[j] - joint_positions[j]) <= self.move_tolerance_rad for j in joint_positions):
                 reached = True
                 break
             time.sleep(0.02)

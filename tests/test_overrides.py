@@ -88,3 +88,39 @@ def test_actuator_kwarg_overrides_env(monkeypatch):
     assert a.home_pose_rad["shoulder_pan"] == pytest.approx(0.20)
     # other joints fall back to defaults (env partial override is overridden by kwarg, kwarg is the same partial form)
     assert a.home_pose_rad["shoulder_lift"] == pytest.approx(0.10)
+
+
+def test_resolve_move_tolerance_rad_no_override(monkeypatch):
+    monkeypatch.delenv("SO_ARM101_MOVE_TOLERANCE_RAD", raising=False)
+    assert config.resolve_move_tolerance_rad() == pytest.approx(0.02)
+
+
+def test_resolve_move_tolerance_rad_env_override(monkeypatch):
+    monkeypatch.setenv("SO_ARM101_MOVE_TOLERANCE_RAD", "0.07")
+    assert config.resolve_move_tolerance_rad() == pytest.approx(0.07)
+
+
+def test_resolve_move_tolerance_rad_invalid_raises(monkeypatch):
+    monkeypatch.setenv("SO_ARM101_MOVE_TOLERANCE_RAD", "not-a-float")
+    with pytest.raises(ValueError, match="SO_ARM101_MOVE_TOLERANCE_RAD"):
+        config.resolve_move_tolerance_rad()
+
+
+def test_resolve_move_tolerance_rad_negative_raises(monkeypatch):
+    monkeypatch.setenv("SO_ARM101_MOVE_TOLERANCE_RAD", "-0.01")
+    with pytest.raises(ValueError, match="positive"):
+        config.resolve_move_tolerance_rad()
+
+
+def test_actuator_uses_env_move_tolerance(monkeypatch):
+    monkeypatch.setenv("SO_ARM101_MOVE_TOLERANCE_RAD", "0.07")
+    from so_arm101_actuator.actuator import SOArm101Actuator
+    a = SOArm101Actuator(protocol=None)
+    assert a.move_tolerance_rad == pytest.approx(0.07)
+
+
+def test_actuator_kwarg_overrides_env_tolerance(monkeypatch):
+    monkeypatch.setenv("SO_ARM101_MOVE_TOLERANCE_RAD", "0.07")
+    from so_arm101_actuator.actuator import SOArm101Actuator
+    a = SOArm101Actuator(protocol=None, move_tolerance_rad=0.15)
+    assert a.move_tolerance_rad == pytest.approx(0.15)

@@ -88,6 +88,20 @@ python -m so_arm101_actuator.sweep --dry-run --iterations 10 --seed 42 --out /tm
 
 The sweep CLI is for hands-on hardware bring-up + demos. Cert evidence (`bob.local/FULL-SWEEP-100`) does NOT come from this CLI; it comes from `opencastor-ops/scripts/hil/` orchestrating pre-signed envelopes through `robot-md-gateway`.
 
+## Calibration (v0.2.1+)
+
+The default `SAFE_RANGE_RAD` and `MOVE_TOLERANCE_RAD` values reflect calibration measurements taken on a specific SO-ARM101 rig (Bob) on 2026-05-10. Different physical rigs will have different mechanical stops and steady-state precision. Operators should:
+
+```bash
+# Override SAFE_RANGE_RAD per joint after measuring your own rig's reachable range
+export SO_ARM101_SAFE_RANGE_RAD='{"elbow_flex": [-0.30, 0.95]}'
+
+# Loosen MOVE_TOLERANCE_RAD if your arm has larger steady-state error (gravity-loaded joints)
+export SO_ARM101_MOVE_TOLERANCE_RAD=0.05
+```
+
+See the sweep CLI (`python -m so_arm101_actuator.sweep --iterations 5 --dry-run`) to generate a sample pose list for your rig.
+
 ## License
 
 Apache-2.0.
