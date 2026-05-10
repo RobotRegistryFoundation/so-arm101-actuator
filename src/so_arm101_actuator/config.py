@@ -54,3 +54,30 @@ def ticks_to_rad(joint: str, ticks: int) -> float:
         raise UnknownJointError(joint)
     spec = JOINTS[joint]
     return (ticks - spec["tick_at_zero_rad"]) / spec["ticks_per_rad"]
+
+
+import json as _json
+import os as _os
+
+
+def resolve_home_pose_rad() -> dict[str, float]:
+    """Return HOME_POSE_RAD merged with SO_ARM101_HOME_POSE_RAD env override.
+
+    Env value MUST be JSON object {joint: rad}. Partial overrides merge with
+    HOME_POSE_RAD defaults. Unknown joint names raise ValueError.
+    """
+    base: dict[str, float] = dict(HOME_POSE_RAD)
+    raw = _os.environ.get("SO_ARM101_HOME_POSE_RAD")
+    if raw is None:
+        return base
+    try:
+        override = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"SO_ARM101_HOME_POSE_RAD: invalid JSON ({e})") from e
+    if not isinstance(override, dict):
+        raise ValueError("SO_ARM101_HOME_POSE_RAD: must be JSON object")
+    for joint, val in override.items():
+        if joint not in JOINTS:
+            raise ValueError(f"SO_ARM101_HOME_POSE_RAD: unknown joint {joint!r}")
+        base[joint] = float(val)
+    return base
