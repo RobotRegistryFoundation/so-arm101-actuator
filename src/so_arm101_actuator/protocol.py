@@ -22,6 +22,8 @@ SCS_REG_GOAL_POSITION = 0x2A
 SCS_INST_WRITE_DATA = 0x03
 SCS_REG_PRESENT_POSITION = 0x38
 SCS_INST_READ_DATA = 0x02
+SCS_REG_PRESENT_TEMPERATURE = 0x3F
+SCS_INST_PING = 0x01
 SCS_TICKS_MAX = 4095  # 12-bit encoder, but reg is 16-bit; allow 0..4095 for SO-ARM101
 
 
@@ -61,3 +63,26 @@ class SCSProtocol:
             raise ProtocolError(f"bad header: {resp!r}")
         lo, hi = resp[5], resp[6]
         return lo | (hi << 8)
+
+    def read_temperature(self, motor_id: int) -> int:
+        """Read Present_Temperature (1 byte) from `motor_id`. Returns temperature in Celsius."""
+        params = bytes([SCS_REG_PRESENT_TEMPERATURE, 0x01])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_READ_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        # 1-byte data → 7-byte status
+        resp = self._serial.read(7)
+        if len(resp) < 7 or resp[:2] != b"\xff\xff":
+            from so_arm101_actuator.errors import ProtocolError
+            raise ProtocolError(f"bad header: {resp!r}")
+        return resp[5]
+
+    def ping(self, motor_id: int) -> bool:
+        """Send a PING to `motor_id`. Returns True if a response is received."""
+        pkt = _build_packet(motor_id=motor_id, instruction=SCS_INST_PING, params=b"")
+        self._serial.write(pkt)
+        resp = self._serial.read(6)
+        return len(resp) == 6 and resp[:2] == b"\xff\xff"

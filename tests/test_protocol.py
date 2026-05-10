@@ -80,3 +80,15 @@ def test_read_position_writes_read_data_packet():
         params=b"\x38\x02",
     )
     assert fake.written == [expected]
+
+
+def test_read_temperature_returns_celsius():
+    fake = FakeSerial(scripted_reads=[_status_with_data(motor_id=2, data=b"\x2d")])  # 45 C
+    proto = SCSProtocol(serial=fake)
+    assert proto.read_temperature(motor_id=2) == 45
+
+
+def test_ping_returns_true_on_response():
+    fake = FakeSerial(scripted_reads=[_status_ok(motor_id=2)])
+    proto = SCSProtocol(serial=fake)
+    assert proto.ping(motor_id=2) is True
