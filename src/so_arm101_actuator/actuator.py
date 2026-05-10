@@ -135,8 +135,8 @@ class SOArm101Actuator:
         )
 
     def home(self, *, timeout_s: float = 10.0) -> MoveResult:
-        """Move all joints to config.HOME_POSE_RAD."""
-        return self.move(config.HOME_POSE_RAD, timeout_s=timeout_s)
+        """Move all joints to the resolved home pose (env/kwarg-overridable)."""
+        return self.move(self.home_pose_rad, timeout_s=timeout_s)
 
     def read_state(self) -> ActuatorState:
         """Read all joint positions and motor temperatures (best-effort).

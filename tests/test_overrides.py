@@ -124,3 +124,34 @@ def test_actuator_kwarg_overrides_env_tolerance(monkeypatch):
     from so_arm101_actuator.actuator import SOArm101Actuator
     a = SOArm101Actuator(protocol=None, move_tolerance_rad=0.15)
     assert a.move_tolerance_rad == pytest.approx(0.15)
+
+
+def test_actuator_home_uses_resolved_pose(monkeypatch):
+    """home() must use self.home_pose_rad (env/kwarg-resolved), not the module-level HOME_POSE_RAD."""
+    import json
+    monkeypatch.setenv("SO_ARM101_HOME_POSE_RAD", json.dumps({"shoulder_pan": 0.13}))
+    from so_arm101_actuator import config
+    from so_arm101_actuator.actuator import SOArm101Actuator
+
+    class FakeProtocol:
+        def __init__(self):
+            self.last_ticks: dict[int, int] = {}
+
+        def set_position(self, motor_id: int, ticks: int) -> None:
+            self.last_ticks[motor_id] = ticks
+
+        def read_position(self, motor_id: int) -> int:
+            # Return whatever was last written so move()'s polling loop sees "reached" immediately.
+            return self.last_ticks.get(motor_id, 2048)
+
+    fake = FakeProtocol()
+    a = SOArm101Actuator(protocol=fake)
+    a.home()
+
+    # shoulder_pan is motor_id=1; env overrides it to 0.13 rad.
+    assert 1 in fake.last_ticks, "home() did not call set_position — protocol interface mismatch?"
+    actual_rad = config.ticks_to_rad("shoulder_pan", fake.last_ticks[1])
+    assert actual_rad == pytest.approx(0.13, abs=0.01), (
+        f"home() used unresolved HOME_POSE_RAD (got {actual_rad:.4f} rad) "
+        f"instead of self.home_pose_rad (env-overridden shoulder_pan=0.13)"
+    )
