@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "so-arm101-actuator"
+version = "0.1.0"
+description = "SO-ARM101 Actuator Protocol driver for robot-md-gateway. RPN-000000000002."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [
+    { name = "RobotRegistryFoundation" },
+]
+dependencies = [
+    "robot-md-gateway>=0.5.0a1",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+
+[project.entry-points."robot_md_gateway.actuators"]
+so-arm101 = "so_arm101_actuator.actuator:SOArm101Actuator"
+
+[project.urls]
+Homepage = "https://github.com/RobotRegistryFoundation/so-arm101-actuator"
+Cookbook = "https://robotmd.dev/cookbook/beat-8/"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/so_arm101_actuator"]
+
+[tool.pytest.ini_options]
+markers = ["hardware: requires real SO-ARM101 hardware (set SO_ARM101_HARDWARE=1 to run)"]
+addopts = "--strict-markers"
