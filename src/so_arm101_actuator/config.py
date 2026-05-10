@@ -6,7 +6,9 @@ Defaults match Bob's wiring and SCS encoder range (0..4095 = full revolution).
 
 from __future__ import annotations
 
+import json as _json
 import math
+import os as _os
 from typing import TypedDict
 
 from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
@@ -54,10 +56,6 @@ def ticks_to_rad(joint: str, ticks: int) -> float:
         raise UnknownJointError(joint)
     spec = JOINTS[joint]
     return (ticks - spec["tick_at_zero_rad"]) / spec["ticks_per_rad"]
-
-
-import json as _json
-import os as _os
 
 
 def resolve_home_pose_rad() -> dict[str, float]:
