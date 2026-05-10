@@ -53,3 +53,30 @@ def test_set_position_clamps_ticks_to_14_bit_range():
     proto = SCSProtocol(serial=fake)
     with pytest.raises(ValueError):
         proto.set_position(motor_id=2, ticks=-1)
+
+
+def _status_with_data(motor_id: int, data: bytes) -> bytes:
+    """A successful status response carrying `data` bytes."""
+    body = bytes([motor_id, len(data) + 2, 0x00]) + data
+    cks = (~sum(body)) & 0xFF
+    return b"\xff\xff" + body + bytes([cks])
+
+
+def test_read_position_returns_servo_value():
+    # Servo reports ticks=2048 → low=00, high=08
+    fake = FakeSerial(scripted_reads=[_status_with_data(motor_id=2, data=b"\x00\x08")])
+    proto = SCSProtocol(serial=fake)
+    assert proto.read_position(motor_id=2) == 2048
+
+
+def test_read_position_writes_read_data_packet():
+    fake = FakeSerial(scripted_reads=[_status_with_data(motor_id=2, data=b"\x00\x08")])
+    proto = SCSProtocol(serial=fake)
+    proto.read_position(motor_id=2)
+    # READ_DATA(0x02) at addr 0x38 for 2 bytes
+    expected = _build_packet(
+        motor_id=2,
+        instruction=0x02,
+        params=b"\x38\x02",
+    )
+    assert fake.written == [expected]

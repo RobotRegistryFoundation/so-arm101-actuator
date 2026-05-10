@@ -20,6 +20,8 @@ def _build_packet(motor_id: int, instruction: int, params: bytes) -> bytes:
 
 SCS_REG_GOAL_POSITION = 0x2A
 SCS_INST_WRITE_DATA = 0x03
+SCS_REG_PRESENT_POSITION = 0x38
+SCS_INST_READ_DATA = 0x02
 SCS_TICKS_MAX = 4095  # 12-bit encoder, but reg is 16-bit; allow 0..4095 for SO-ARM101
 
 
@@ -42,3 +44,20 @@ class SCSProtocol:
         self._serial.write(pkt)
         # Drain status packet (6 bytes for a no-param OK response).
         self._serial.read(6)
+
+    def read_position(self, motor_id: int) -> int:
+        """Read Present_Position (2 bytes) from `motor_id`. Returns ticks."""
+        params = bytes([SCS_REG_PRESENT_POSITION, 0x02])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_READ_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        # Status packet: FF FF ID LEN ERR LO HI CKS = 8 bytes
+        resp = self._serial.read(8)
+        if len(resp) < 8 or resp[:2] != b"\xff\xff":
+            from so_arm101_actuator.errors import ProtocolError
+            raise ProtocolError(f"bad header: {resp!r}")
+        lo, hi = resp[5], resp[6]
+        return lo | (hi << 8)
