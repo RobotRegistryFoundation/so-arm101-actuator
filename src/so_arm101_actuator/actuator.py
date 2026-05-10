@@ -83,6 +83,30 @@ class SOArm101Actuator:
         """Move all joints to config.HOME_POSE_RAD."""
         return self.move(config.HOME_POSE_RAD, timeout_s=timeout_s)
 
+    def read_state(self) -> ActuatorState:
+        """Read all joint positions and motor temperatures (best-effort).
+
+        Returns a snapshot of the current actuator state with positions in
+        radians and temperatures in celsius. If a motor's temperature sensor
+        fails to read, that motor is silently omitted from motor_temps_c.
+        """
+        positions: dict[str, float] = {}
+        temps: dict[str, float] = {}
+        for joint in config.JOINTS:
+            positions[joint] = self._read_joint(joint)
+            try:
+                temps[joint] = float(self._protocol.read_temperature(
+                    motor_id=config.JOINTS[joint]["motor_id"],
+                ))
+            except (IOError, OSError):
+                # Best-effort — joints without a temp sensor are simply omitted.
+                pass
+        return ActuatorState(
+            positions=positions,
+            motor_temps_c=temps,
+            timestamp_s=time.monotonic(),
+        )
+
     def _read_joint(self, joint: str) -> float:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)

@@ -56,3 +56,36 @@ def test_home_uses_home_pose_rad():
     # All 6 joints commanded to ticks_at_zero_rad (== 2048 for all in default config)
     assert proto.set_position.call_count == 6
     assert result["reached"] is True
+
+
+def test_read_state_returns_all_joints():
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    state = actuator.read_state()
+    assert set(state["positions"].keys()) == {
+        "shoulder_pan", "shoulder_lift", "elbow_flex",
+        "wrist_flex", "wrist_roll", "gripper",
+    }
+    assert all(abs(v) < 0.01 for v in state["positions"].values())  # all near zero
+
+
+def test_read_state_includes_temperatures():
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    state = actuator.read_state()
+    assert all(t == 30 for t in state["motor_temps_c"].values())
+
+
+def test_read_state_skips_motors_that_fail_temperature_read():
+    proto = MagicMock()
+    proto.read_position.return_value = 2048
+    proto.read_temperature.side_effect = [30, 30, 30, 30, 30, IOError("no sensor")]
+    actuator = SOArm101Actuator(protocol=proto)
+    state = actuator.read_state()
+    # 5 motors report temperature; gripper missing
+    assert len(state["motor_temps_c"]) == 5
+    assert "gripper" not in state["motor_temps_c"]
+
+
+def test_read_state_has_timestamp():
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    state = actuator.read_state()
+    assert state["timestamp_s"] > 0
