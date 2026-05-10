@@ -60,6 +60,34 @@ SO_ARM101_HARDWARE=1 pytest tests/test_hardware.py -v
 
 Skipped by default. Run on real hardware only.
 
+## Operator overrides (v0.2.0+)
+
+Two env vars allow operator-specific tuning without code changes. Both are JSON, partially merged with defaults.
+
+```bash
+# Override HOME_POSE_RAD for one joint (e.g., gravity-load on shoulder_lift)
+export SO_ARM101_HOME_POSE_RAD='{"shoulder_lift": 0.10}'
+
+# Tighten SAFE_RANGE_RAD for shoulder_pan
+export SO_ARM101_SAFE_RANGE_RAD='{"shoulder_pan": [-0.5, 0.5]}'
+```
+
+`HOME_POSE_RAD` can also be set via the `home_pose_rad=` constructor kwarg (kwarg overrides env).
+
+## Sweep CLI (v0.2.0+)
+
+A developer-facing range-of-motion test that drives all 6 joints with random poses and prints a live status table.
+
+```bash
+# 100 iterations, default seed
+python -m so_arm101_actuator.sweep
+
+# Dry-run (no hardware): print 10 planned poses to JSONL
+python -m so_arm101_actuator.sweep --dry-run --iterations 10 --seed 42 --out /tmp/poses.jsonl
+```
+
+The sweep CLI is for hands-on hardware bring-up + demos. Cert evidence (`bob.local/FULL-SWEEP-100`) does NOT come from this CLI; it comes from `opencastor-ops/scripts/hil/` orchestrating pre-signed envelopes through `robot-md-gateway`.
+
 ## License
 
 Apache-2.0.

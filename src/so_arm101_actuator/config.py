@@ -6,7 +6,9 @@ Defaults match Bob's wiring and SCS encoder range (0..4095 = full revolution).
 
 from __future__ import annotations
 
+import json as _json
 import math
+import os as _os
 from typing import TypedDict
 
 from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
@@ -54,3 +56,70 @@ def ticks_to_rad(joint: str, ticks: int) -> float:
         raise UnknownJointError(joint)
     spec = JOINTS[joint]
     return (ticks - spec["tick_at_zero_rad"]) / spec["ticks_per_rad"]
+
+
+def resolve_home_pose_rad() -> dict[str, float]:
+    """Return HOME_POSE_RAD merged with SO_ARM101_HOME_POSE_RAD env override.
+
+    Env value MUST be JSON object {joint: rad}. Partial overrides merge with
+    HOME_POSE_RAD defaults. Unknown joint names raise ValueError.
+    """
+    base: dict[str, float] = dict(HOME_POSE_RAD)
+    raw = _os.environ.get("SO_ARM101_HOME_POSE_RAD")
+    if raw is None:
+        return base
+    try:
+        override = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"SO_ARM101_HOME_POSE_RAD: invalid JSON ({e})") from e
+    if not isinstance(override, dict):
+        raise ValueError("SO_ARM101_HOME_POSE_RAD: must be JSON object")
+    for joint, val in override.items():
+        if joint not in JOINTS:
+            raise ValueError(f"SO_ARM101_HOME_POSE_RAD: unknown joint {joint!r}")
+        base[joint] = float(val)
+    return base
+
+
+SAFE_RANGE_RAD: dict[str, tuple[float, float]] = {
+    "shoulder_pan": (-0.8, 0.8),
+    "shoulder_lift": (-0.2, 0.4),     # gravity-asymmetric
+    "elbow_flex": (-0.6, 0.6),
+    "wrist_flex": (-0.5, 0.5),
+    "wrist_roll": (-1.0, 1.0),
+    "gripper": (0.0, 0.5),            # 0 = closed; 0.5 = mechanical max
+}
+
+
+def resolve_safe_range_rad() -> dict[str, tuple[float, float]]:
+    """Return SAFE_RANGE_RAD merged with SO_ARM101_SAFE_RANGE_RAD env override.
+
+    Env value MUST be JSON object {joint: [min, max]}. Each override range
+    must lie within JOINTS[joint] mechanical limits and have min < max.
+    """
+    base: dict[str, tuple[float, float]] = dict(SAFE_RANGE_RAD)
+    raw = _os.environ.get("SO_ARM101_SAFE_RANGE_RAD")
+    if raw is None:
+        return base
+    try:
+        override = _json.loads(raw)
+    except _json.JSONDecodeError as e:
+        raise ValueError(f"SO_ARM101_SAFE_RANGE_RAD: invalid JSON ({e})") from e
+    if not isinstance(override, dict):
+        raise ValueError("SO_ARM101_SAFE_RANGE_RAD: must be JSON object")
+    for joint, pair in override.items():
+        if joint not in JOINTS:
+            raise ValueError(f"SO_ARM101_SAFE_RANGE_RAD: unknown joint {joint!r}")
+        if not (isinstance(pair, list) and len(pair) == 2):
+            raise ValueError(f"SO_ARM101_SAFE_RANGE_RAD: {joint} must be [min, max]")
+        lo, hi = float(pair[0]), float(pair[1])
+        if lo >= hi:
+            raise ValueError(f"SO_ARM101_SAFE_RANGE_RAD: {joint} min {lo} >= max {hi}")
+        spec = JOINTS[joint]
+        if lo < spec["min_rad"] or hi > spec["max_rad"]:
+            raise ValueError(
+                f"SO_ARM101_SAFE_RANGE_RAD: {joint} [{lo}, {hi}] outside mechanical "
+                f"[{spec['min_rad']}, {spec['max_rad']}]"
+            )
+        base[joint] = (lo, hi)
+    return base
