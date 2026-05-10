@@ -1,6 +1,6 @@
 """SO-ARM101 Actuator Protocol driver. RPN-000000000002."""
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 __rpn__ = "RPN-000000000002"
 
 from so_arm101_actuator.actuator import SOArm101Actuator

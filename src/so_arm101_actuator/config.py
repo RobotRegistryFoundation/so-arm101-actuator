@@ -82,13 +82,32 @@ def resolve_home_pose_rad() -> dict[str, float]:
 
 
 SAFE_RANGE_RAD: dict[str, tuple[float, float]] = {
-    "shoulder_pan": (-0.8, 0.8),
-    "shoulder_lift": (-0.2, 0.4),     # gravity-asymmetric
-    "elbow_flex": (-0.6, 0.6),
-    "wrist_flex": (-0.5, 0.5),
-    "wrist_roll": (-1.0, 1.0),
-    "gripper": (0.0, 0.5),            # 0 = closed; 0.5 = mechanical max
+    "shoulder_pan":  (-1.40, 1.40),   # observed reachable ±1.46 on Bob; 0.05 margin (calibrated 2026-05-10)
+    "shoulder_lift": (-0.90, 1.00),   # observed reachable (-0.95, 1.00); neg side gravity-limited (calibrated 2026-05-10)
+    "elbow_flex":    (-0.19, 0.94),   # mechanical floor ~-0.241 rad on Bob; pos near-free to 0.99 (calibrated 2026-05-10)
+    "wrist_flex":    (-0.93, 0.41),   # mechanical ceiling ~+0.462 rad on Bob (calibrated 2026-05-10)
+    "wrist_roll":    (-1.94, 1.49),   # mechanical ceiling ~+1.537 rad on Bob; asymmetric (calibrated 2026-05-10)
+    "gripper":       (0.0, 0.49),     # 0 = closed; 0.49 = near-mechanical-max
 }
+
+
+def resolve_move_tolerance_rad() -> float:
+    """Return MOVE_TOLERANCE_RAD merged with SO_ARM101_MOVE_TOLERANCE_RAD env override.
+
+    Env value MUST be a positive float (string-parseable). Default 0.02 rad ≈ 1.15°.
+    Operators with rigs that have larger steady-state error (e.g., gravity-loaded
+    joints) may want to relax this.
+    """
+    raw = _os.environ.get("SO_ARM101_MOVE_TOLERANCE_RAD")
+    if raw is None:
+        return MOVE_TOLERANCE_RAD
+    try:
+        val = float(raw)
+    except ValueError as e:
+        raise ValueError(f"SO_ARM101_MOVE_TOLERANCE_RAD: invalid float {raw!r}") from e
+    if val <= 0:
+        raise ValueError(f"SO_ARM101_MOVE_TOLERANCE_RAD: must be positive, got {val}")
+    return val
 
 
 def resolve_safe_range_rad() -> dict[str, tuple[float, float]]:
