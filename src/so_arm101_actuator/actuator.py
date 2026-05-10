@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from typing import TypedDict
+
+from robot_md_gateway.actuator import ActuatorOutcome
 
 from so_arm101_actuator import config
 from so_arm101_actuator.errors import (
@@ -31,6 +34,10 @@ class SOArm101Actuator:
     Constructed with an `SCSProtocol` (or compatible mock for tests). The
     default factory in `from_default_port` opens `/dev/ttyACM0` at 1 Mbps.
     """
+
+    name = "so-arm101"
+    description = "SO-ARM101 6-DOF + gripper Actuator Protocol driver. RPN-000000000002."
+    config_schema: dict = {}
 
     capabilities = ("move", "home", "read_state")
 
@@ -110,3 +117,45 @@ class SOArm101Actuator:
     def _read_joint(self, joint: str) -> float:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)
+
+    def execute(
+        self,
+        *,
+        envelope: dict,
+        manifest_path: Path,
+        tier: str,
+        config: dict,
+    ) -> ActuatorOutcome:
+        """Dispatch an RCAN INVOKE envelope to the appropriate internal method.
+
+        Maps ``envelope["tool_name"]`` to ``move`` / ``home`` / ``read_state``.
+        Unknown capabilities and actuator exceptions are both converted to an
+        error ``ActuatorOutcome`` so the gateway audit chain always receives a
+        structured result.
+        """
+        tool_name = envelope.get("tool_name")
+        tool_args = envelope.get("tool_args", {}) or {}
+        method = {
+            "move": self.move,
+            "home": self.home,
+            "read_state": self.read_state,
+        }.get(tool_name)
+        if method is None:
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="error",
+                error_message=f"unknown capability: {tool_name!r}",
+            )
+        try:
+            result = method(**tool_args)
+        except Exception as exc:  # noqa: BLE001 — actuator code is operator-supplied; exceptions become outcomes
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="error",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
+        return ActuatorOutcome(
+            success=True,
+            outcome_kind="executed",
+            telemetry=dict(result) if isinstance(result, dict) else {"result": result},
+        )

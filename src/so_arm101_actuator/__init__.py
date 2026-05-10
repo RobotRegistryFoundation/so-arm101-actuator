@@ -2,3 +2,7 @@
 
 __version__ = "0.1.0"
 __rpn__ = "RPN-000000000002"
+
+from so_arm101_actuator.actuator import SOArm101Actuator
+
+__all__ = ["SOArm101Actuator", "__version__", "__rpn__"]
