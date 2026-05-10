@@ -71,3 +71,20 @@ def test_resolve_safe_range_rad_outside_mechanical_raises(monkeypatch):
     monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", json.dumps({"shoulder_pan": [-99.0, 99.0]}))
     with pytest.raises(ValueError, match="mechanical"):
         config.resolve_safe_range_rad()
+
+
+def test_actuator_uses_default_home_pose(monkeypatch):
+    monkeypatch.delenv("SO_ARM101_HOME_POSE_RAD", raising=False)
+    from so_arm101_actuator.actuator import SOArm101Actuator
+    a = SOArm101Actuator(protocol=None)
+    assert a.home_pose_rad["shoulder_lift"] == pytest.approx(0.10)
+
+
+def test_actuator_kwarg_overrides_env(monkeypatch):
+    import json
+    monkeypatch.setenv("SO_ARM101_HOME_POSE_RAD", json.dumps({"shoulder_pan": 0.05}))
+    from so_arm101_actuator.actuator import SOArm101Actuator
+    a = SOArm101Actuator(protocol=None, home_pose_rad={"shoulder_pan": 0.20})
+    assert a.home_pose_rad["shoulder_pan"] == pytest.approx(0.20)
+    # other joints fall back to defaults (env partial override is overridden by kwarg, kwarg is the same partial form)
+    assert a.home_pose_rad["shoulder_lift"] == pytest.approx(0.10)

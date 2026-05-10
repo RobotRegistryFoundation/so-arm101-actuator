@@ -41,7 +41,12 @@ class SOArm101Actuator:
 
     capabilities = ("move", "home", "read_state")
 
-    def __init__(self, protocol=None) -> None:  # noqa: ANN001 — duck-typed
+    def __init__(
+        self,
+        protocol=None,  # noqa: ANN001 — duck-typed
+        *,
+        home_pose_rad: dict[str, float] | None = None,
+    ) -> None:
         """Create an actuator.
 
         Args:
@@ -49,7 +54,16 @@ class SOArm101Actuator:
                 ``None`` (the default), the gateway entry-point path, the
                 protocol is opened lazily on the first ``execute()`` call via
                 ``_ensure_protocol()``.
+            home_pose_rad: Optional dict of {joint: rad} to override the
+                default home pose (from environment SO_ARM101_HOME_POSE_RAD or
+                config.HOME_POSE_RAD). Partial dicts merge with defaults,
+                with this kwarg taking precedence per joint.
         """
+        env_pose = config.resolve_home_pose_rad()
+        if home_pose_rad is not None:
+            # kwarg merges on top of env-resolved pose (kwarg wins per joint)
+            env_pose = {**env_pose, **home_pose_rad}
+        self.home_pose_rad: dict[str, float] = env_pose
         self._protocol = protocol
 
     @classmethod
