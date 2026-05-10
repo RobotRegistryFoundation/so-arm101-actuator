@@ -48,3 +48,11 @@ def test_move_returns_final_positions():
     result = actuator.move({"shoulder_pan": 0.0, "shoulder_lift": 0.233}, timeout_s=0.1)
     assert "shoulder_pan" in result["final_positions"]
     assert "shoulder_lift" in result["final_positions"]
+
+
+def test_home_uses_home_pose_rad():
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    result = actuator.home(timeout_s=0.1)
+    # All 6 joints commanded to ticks_at_zero_rad (== 2048 for all in default config)
+    assert proto.set_position.call_count == 6
+    assert result["reached"] is True

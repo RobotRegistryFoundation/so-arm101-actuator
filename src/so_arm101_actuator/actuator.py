@@ -79,6 +79,10 @@ class SOArm101Actuator:
             elapsed_s=time.monotonic() - start,
         )
 
+    def home(self, *, timeout_s: float = 10.0) -> MoveResult:
+        """Move all joints to config.HOME_POSE_RAD."""
+        return self.move(config.HOME_POSE_RAD, timeout_s=timeout_s)
+
     def _read_joint(self, joint: str) -> float:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)
