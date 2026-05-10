@@ -68,3 +68,30 @@ def test_dry_run_does_not_import_pyserial():
         capture_output=True, text=True, check=True,
     )
     assert result.returncode == 0
+
+
+def test_status_table_smoke():
+    from so_arm101_actuator.sweep_table import StatusTable
+    table = StatusTable()
+    table.start(total=2)
+    table.update(0, {"shoulder_pan": 0.1}, {"shoulder_pan": 0.1}, latency_ms=312)
+    table.update(1, {"shoulder_pan": -0.1}, {"shoulder_pan": -0.1}, latency_ms=298)
+    table.stop()
+
+
+def test_status_table_fallback_when_rich_missing(monkeypatch):
+    """If rich import fails, StatusTable degrades to plain-text printer; never raises."""
+    import importlib
+    import sys
+    monkeypatch.setitem(sys.modules, "rich", None)
+    monkeypatch.setitem(sys.modules, "rich.live", None)
+    monkeypatch.setitem(sys.modules, "rich.table", None)
+    # Remove the module so it will be re-imported with rich blocked
+    sys.modules.pop("so_arm101_actuator.sweep_table", None)
+    # Re-import with rich blocked
+    from so_arm101_actuator import sweep_table as mod
+    # Now test the fallback behavior
+    t = mod.StatusTable()
+    t.start(total=1)
+    t.update(0, {"shoulder_pan": 0.1}, {"shoulder_pan": 0.1}, 100)
+    t.stop()  # must not raise
