@@ -41,7 +41,15 @@ class SOArm101Actuator:
 
     capabilities = ("move", "home", "read_state")
 
-    def __init__(self, protocol) -> None:  # noqa: ANN001 — duck-typed
+    def __init__(self, protocol=None) -> None:  # noqa: ANN001 — duck-typed
+        """Create an actuator.
+
+        Args:
+            protocol: An ``SCSProtocol`` instance (or compatible mock). When
+                ``None`` (the default), the gateway entry-point path, the
+                protocol is opened lazily on the first ``execute()`` call via
+                ``_ensure_protocol()``.
+        """
         self._protocol = protocol
 
     @classmethod
@@ -50,6 +58,21 @@ class SOArm101Actuator:
         from so_arm101_actuator.protocol import SCSProtocol
         ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
         return cls(protocol=SCSProtocol(serial=ser))
+
+    def _ensure_protocol(self, *, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> None:
+        """Open the serial port if no protocol was injected at construction.
+
+        Raises ``IOError`` (subclass of ``OSError``) if the device is
+        unavailable; callers catch this and convert it to an error
+        ``ActuatorOutcome``.
+        """
+        if self._protocol is not None:
+            return
+        import serial
+        from so_arm101_actuator.protocol import SCSProtocol
+        self._protocol = SCSProtocol(
+            serial=serial.Serial(port=port, baudrate=baud, timeout=0.1)
+        )
 
     def move(self, joint_positions: dict[str, float], *, timeout_s: float = 5.0) -> MoveResult:
         # Validate before any wire traffic.
@@ -147,6 +170,9 @@ class SOArm101Actuator:
                 error_message=f"unknown capability: {tool_name!r}",
             )
         try:
+            port = (config or {}).get("port", "/dev/ttyACM0")
+            baud = int((config or {}).get("baud", 1_000_000))
+            self._ensure_protocol(port=port, baud=baud)
             result = method(**tool_args)
         except Exception as exc:  # noqa: BLE001 — actuator code is operator-supplied; exceptions become outcomes
             return ActuatorOutcome(

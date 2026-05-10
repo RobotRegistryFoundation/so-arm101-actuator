@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "so-arm101-actuator"
-version = "0.1.0"
+version = "0.1.1"
 description = "SO-ARM101 Actuator Protocol driver for robot-md-gateway. RPN-000000000002."
 readme = "README.md"
 requires-python = ">=3.10"

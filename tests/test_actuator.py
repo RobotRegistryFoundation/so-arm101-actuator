@@ -108,6 +108,11 @@ def test_read_state_has_timestamp():
 # Task 13 — Actuator Protocol bridge (gateway integration)
 # ---------------------------------------------------------------------------
 
+def test_zero_arg_instantiation():
+    """Gateway entry-point calls SOArm101Actuator() with no args — must not raise."""
+    SOArm101Actuator()  # regression guard: gateway calls actuator_cls() at startup
+
+
 def test_capabilities_tuple_unchanged():
     actuator, _ = _make_actuator()
     assert actuator.capabilities == ("move", "home", "read_state")
