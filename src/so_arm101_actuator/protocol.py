@@ -23,6 +23,7 @@ SCS_INST_WRITE_DATA = 0x03
 SCS_REG_PRESENT_POSITION = 0x38
 SCS_INST_READ_DATA = 0x02
 SCS_REG_PRESENT_TEMPERATURE = 0x3F
+SCS_REG_TORQUE_ENABLE = 0x28  # Torque_Enable: 1 byte (0 = free/limp, 1 = energized)
 SCS_INST_PING = 0x01
 SCS_TICKS_MAX = 4095  # 12-bit encoder, but reg is 16-bit; allow 0..4095 for SO-ARM101
 
@@ -47,6 +48,24 @@ class SCSProtocol:
         # Drain status packet (6 bytes for a no-param OK response).
         self._serial.read(6)
 
+    def set_torque(self, motor_id: int, enable: bool) -> None:
+        """Write Torque_Enable on `motor_id` (reg 0x28).
+
+        ``enable=False`` frees the joint so it can be back-driven by hand (the
+        teach path's torque-off, done *through the gateway* so safety stays on —
+        no ``systemctl stop``); ``True`` re-energizes it. Mirrors
+        ``set_position``'s WRITE_DATA framing and drains the status packet.
+        """
+        params = bytes([SCS_REG_TORQUE_ENABLE, 0x01 if enable else 0x00])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_WRITE_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        # Drain status packet (6 bytes for a no-param OK response), like set_position.
+        self._serial.read(6)
+
     def read_position(self, motor_id: int) -> int:
         """Read Present_Position (2 bytes) from `motor_id`. Returns ticks."""
         params = bytes([SCS_REG_PRESENT_POSITION, 0x02])
@@ -60,6 +79,7 @@ class SCSProtocol:
         resp = self._serial.read(8)
         if len(resp) < 8 or resp[:2] != b"\xff\xff":
             from so_arm101_actuator.errors import ProtocolError
+
             raise ProtocolError(f"bad header: {resp!r}")
         lo, hi = resp[5], resp[6]
         return lo | (hi << 8)
@@ -77,6 +97,7 @@ class SCSProtocol:
         resp = self._serial.read(7)
         if len(resp) < 7 or resp[:2] != b"\xff\xff":
             from so_arm101_actuator.errors import ProtocolError
+
             raise ProtocolError(f"bad header: {resp!r}")
         return resp[5]
 
