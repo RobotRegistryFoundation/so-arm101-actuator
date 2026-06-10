@@ -113,9 +113,11 @@ def test_zero_arg_instantiation():
     SOArm101Actuator()  # regression guard: gateway calls actuator_cls() at startup
 
 
-def test_capabilities_tuple_unchanged():
+def test_capabilities_preserves_core_trio():
+    # B1 added commissioning ops (set_torque/raw_tick_move/commission_probe/paced_move);
+    # the original move/home/read_state contract must remain advertised.
     actuator, _ = _make_actuator()
-    assert actuator.capabilities == ("move", "home", "read_state")
+    assert {"move", "home", "read_state"}.issubset(actuator.capabilities)
 
 
 def test_implements_actuator_protocol():

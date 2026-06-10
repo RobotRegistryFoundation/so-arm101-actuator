@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "so-arm101-actuator"
-version = "0.2.2"
+version = "0.3.0a1"
 description = "SO-ARM101 Actuator Protocol driver for robot-md-gateway. RPN-000000000002."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,6 +16,7 @@ dependencies = [
     "robot-md-gateway>=0.5.0a1",
     "pyserial>=3.5",
     "rich>=13",
+    "rcan>=3.4.0",  # A2: manifest-authoritative rad<->tick reads frontmatter via rcan.manifest
 ]
 
 [project.optional-dependencies]
