@@ -1,10 +1,12 @@
 name: CI
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  # Manual-only: all CI runs LOCALLY (operator directive 2026-06-19 — the org's
+  # GitHub Actions are billing-blocked and we keep CI/deploys off Actions). Run:
+  #   pip install -e ".[dev]" && pytest tests/ -m "not hardware"
+  # (castor-hal is a path/local dependency that isn't on PyPI, so a hosted runner
+  # can't resolve it anyway.) Restore [push, pull_request] if Actions returns.
+  workflow_dispatch:
 
 jobs:
   test:
