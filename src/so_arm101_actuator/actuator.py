@@ -183,6 +183,27 @@ class SOArm101Actuator:
         """
         tool_name = envelope.get("tool_name")
         tool_args = envelope.get("tool_args", {}) or {}
+        # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
+        # stay unmapped: they need the vision rig, and the gateway deny-lists
+        # them via ROBOT_MD_TOOL_ALLOWLIST so clients get a signed DENY instead.
+        if tool_name == "arm.home":
+            # Five-joint home: the gripper's tick zero is contested between the
+            # manifest (1539) and this module's 2048 assumption — never command it.
+            pose = {j: r for j, r in self.home_pose_rad.items() if j != "gripper"}
+            tool_name, tool_args = "move", {"joint_positions": pose}
+        elif tool_name == "status.report":
+            tool_name, tool_args = "read_state", {}
+        elif tool_name == "arm.reach":
+            target = tool_args.get("target", "ready")
+            if target != "ready":
+                return ActuatorOutcome(
+                    success=False,
+                    outcome_kind="error",
+                    error_message=f"unknown reach target: {target!r}",
+                )
+            reach_pose = {j: r for j, r in self.home_pose_rad.items() if j != "gripper"}
+            reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
+            tool_name, tool_args = "move", {"joint_positions": reach_pose}
         method = {
             "move": self.move,
             "home": self.home,
