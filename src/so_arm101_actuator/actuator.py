@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -26,6 +27,22 @@ class ActuatorState(TypedDict):
     positions: dict[str, float]
     motor_temps_c: dict[str, float]
     timestamp_s: float
+
+
+#: One servo bus, one caller at a time. The gateway serves /v1/invoke from a
+#: threadpool, so two overlapping requests previously interleaved reads and
+#: writes on the same unlocked pyserial handle and BOTH returned HTTP 500
+#: (reproduced 6/6). Mutual exclusion has to live here, at the device owner —
+#: rate-limiting one client cannot help when a second client exists.
+_BUS_LOCK = threading.Lock()
+
+#: ROBOT.md capability names this driver can actually execute. Declared-but-
+#: unimplemented capabilities (arm.pick / arm.place need the vision rig and a
+#: calibrated gripper) are deliberately absent: allowing one through policy
+#: would turn a clean signed DENY into a confusing actuator 500.
+IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
+    "arm.home", "arm.reach", "status.report",
+})
 
 
 #: Minimum caller tiers per tool, enforced inside ``execute`` as defense in
@@ -251,8 +268,12 @@ class SOArm101Actuator:
         try:
             port = (config or {}).get("port", "/dev/ttyACM0")
             baud = int((config or {}).get("baud", 1_000_000))
-            self._ensure_protocol(port=port, baud=baud)
-            result = method(**tool_args)
+            # Held across open AND the whole operation: a move polls the bus
+            # repeatedly until it converges, and a read slipped in between
+            # those polls corrupts both.
+            with _BUS_LOCK:
+                self._ensure_protocol(port=port, baud=baud)
+                result = method(**tool_args)
         except (OSError, IOError) as exc:
             # The serial handle is held for the process lifetime, so a USB
             # replug leaves a dead fd that would fail every later invoke. Drop
