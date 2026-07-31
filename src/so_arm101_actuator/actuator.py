@@ -28,6 +28,21 @@ class ActuatorState(TypedDict):
     timestamp_s: float
 
 
+#: Minimum caller tiers per tool, enforced inside ``execute`` as defense in
+#: depth. The gateway's tier gate keys off the envelope's self-declared
+#: ``scope``, which the caller controls; these bindings key off the TOOL, which
+#: the operator controls via the allowlist. ``anon`` appears nowhere: an
+#: unauthenticated caller can neither move the arm nor read the servo bus.
+REQUIRED_TIERS: dict[str, frozenset[str]] = {
+    "arm.home": frozenset({"actuate", "commission"}),
+    "arm.reach": frozenset({"actuate", "commission"}),
+    "move": frozenset({"actuate", "commission"}),
+    "home": frozenset({"actuate", "commission"}),
+    "status.report": frozenset({"read", "actuate", "commission"}),
+    "read_state": frozenset({"read", "actuate", "commission"}),
+}
+
+
 class SOArm101Actuator:
     """RobotRegistryFoundation/so-arm101-actuator v0.1.0 — RPN-000000000002.
 
@@ -183,6 +198,24 @@ class SOArm101Actuator:
         """
         tool_name = envelope.get("tool_name")
         tool_args = envelope.get("tool_args", {}) or {}
+
+        # Tier is re-checked HERE against the tool, not against the envelope's
+        # self-declared `scope`. The gateway's two gates are independent —
+        # check_tier sees only (tier, scope) and check_tool only (tool_name,
+        # allowlist) — so an envelope claiming scope="OBSERVE" while naming a
+        # motion tool passes both. Binding tier to the TOOL is the check that
+        # cannot be talked out of by envelope contents.
+        required = REQUIRED_TIERS.get(tool_name)
+        if required is not None and tier not in required:
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="error",
+                error_message=(
+                    f"tier {tier!r} may not invoke {tool_name!r} "
+                    f"(requires one of {sorted(required)})"
+                ),
+            )
+
         # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
         # stay unmapped: they need the vision rig, and the gateway deny-lists
         # them via ROBOT_MD_TOOL_ALLOWLIST so clients get a signed DENY instead.
@@ -220,6 +253,16 @@ class SOArm101Actuator:
             baud = int((config or {}).get("baud", 1_000_000))
             self._ensure_protocol(port=port, baud=baud)
             result = method(**tool_args)
+        except (OSError, IOError) as exc:
+            # The serial handle is held for the process lifetime, so a USB
+            # replug leaves a dead fd that would fail every later invoke. Drop
+            # it so the next invoke re-opens by-id instead of needing a restart.
+            self._protocol = None
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="error",
+                error_message=f"{type(exc).__name__}: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001 — actuator code is operator-supplied; exceptions become outcomes
             return ActuatorOutcome(
                 success=False,
