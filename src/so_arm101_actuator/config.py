@@ -161,6 +161,20 @@ def apply_manifest_calibration(path: str | None = None) -> dict:
     return changed
 
 
+def gripper_geometry_known(path: str | None = None) -> bool:
+    """Did the manifest declare BOTH the gripper's zero and its jaw travel?
+
+    Deliberately asks the manifest rather than the diff returned by
+    apply_manifest_calibration(): that diff lists only values that CHANGED, so a
+    manifest zero identical to the module constant would be absent from it and
+    a correctly-calibrated joint would look uncalibrated.
+    """
+    data = load_manifest_calibration(path)
+    grip = data.get("gripper", {})
+    return ("gripper" in data.get("zeros", {})
+            and "open_steps" in grip and "close_steps" in grip)
+
+
 def manifest_home_pose_rad(path: str | None = None) -> dict[str, float]:
     """The manifest's taught `ready` pose, in radians against the CURRENT zeros.
 
@@ -176,11 +190,17 @@ def manifest_home_pose_rad(path: str | None = None) -> dict[str, float]:
             for joint, value in ticks.items() if joint in JOINTS}
 
 
-def resolve_home_pose_rad() -> dict[str, float]:
+def resolve_home_pose_rad(path: str | None = None) -> dict[str, float]:
     """Return HOME_POSE_RAD merged with SO_ARM101_HOME_POSE_RAD env override.
 
     Env value MUST be JSON object {joint: rad}. Partial overrides merge with
     HOME_POSE_RAD defaults. Unknown joint names raise ValueError.
+
+    `path` MUST be threaded through by any caller that also applied a manifest
+    from an explicit path. Correcting the tick zeros without also taking the
+    taught pose from the SAME manifest is the dangerous combination: the generic
+    radian constants then resolve against the new zeros and command the arm to
+    its raw zero position instead of the pose someone actually taught it.
     """
     # Prefer the manifest's taught pose. It is stored in TICKS, so it stays
     # correct no matter what zero convention the driver uses — unlike a radian
@@ -188,7 +208,7 @@ def resolve_home_pose_rad() -> dict[str, float]:
     # corrected.
     base: dict[str, float] = dict(HOME_POSE_RAD)
     try:
-        taught = manifest_home_pose_rad()
+        taught = manifest_home_pose_rad(path)
         if taught:
             base.update(taught)
     except Exception:

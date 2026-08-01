@@ -137,7 +137,7 @@ def test_execute_dispatches_move():
     outcome = actuator.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"shoulder_pan": 0.0}, "timeout_s": 0.1}},
         manifest_path=Path("/tmp/dummy.md"),
-        tier="op",
+        tier="actuate",
         config={},
     )
     assert outcome.success is True
@@ -151,7 +151,7 @@ def test_execute_dispatches_home():
     outcome = actuator.execute(
         envelope={"tool_name": "home", "tool_args": {"timeout_s": 0.1}},
         manifest_path=Path("/tmp/dummy.md"),
-        tier="op",
+        tier="actuate",
         config={},
     )
     assert outcome.success is True
@@ -164,7 +164,7 @@ def test_execute_dispatches_read_state():
     outcome = actuator.execute(
         envelope={"tool_name": "read_state", "tool_args": {}},
         manifest_path=Path("/tmp/dummy.md"),
-        tier="op",
+        tier="read",
         config={},
     )
     assert outcome.success is True
@@ -178,7 +178,7 @@ def test_execute_unknown_capability_returns_error_outcome():
     outcome = actuator.execute(
         envelope={"tool_name": "teleport", "tool_args": {}},
         manifest_path=Path("/tmp/dummy.md"),
-        tier="op",
+        tier="actuate",
         config={},
     )
     assert outcome.success is False
@@ -192,7 +192,7 @@ def test_execute_actuator_exception_becomes_error_outcome():
     outcome = actuator.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"not_a_joint": 0.0}}},
         manifest_path=Path("/tmp/dummy.md"),
-        tier="op",
+        tier="actuate",
         config={},
     )
     assert outcome.success is False

@@ -24,7 +24,43 @@ SCS_REG_PRESENT_POSITION = 0x38
 SCS_INST_READ_DATA = 0x02
 SCS_REG_PRESENT_TEMPERATURE = 0x3F
 SCS_INST_PING = 0x01
-SCS_TICKS_MAX = 4095  # 12-bit encoder, but reg is 16-bit; allow 0..4095 for SO-ARM101
+SCS_TICKS_MAX = 4095
+
+#: On the STS/SMS series every register below this address is EEPROM; everything
+#: at or above it is RAM. Refusing writes below the boundary is one check that
+#: covers every irreversible mistake at once:
+#:
+#:   5  ID / 6 Baud_Rate      — the servo vanishes from the bus, or collides
+#:                               with a sibling
+#:   9  / 11 position limits  — and if BOTH are zero the servo enters
+#:                               continuous-rotation mode, where Goal_Position
+#:                               means SPEED. Any "bounded travel" guard would
+#:                               then bound nothing at all.
+#:   31 Homing_Offset         — silently shifts every future position read,
+#:                               invalidating the manifest's taught poses
+#:   33 Operating_Mode        — makes Goal_Position mean velocity/PWM/step
+#:   13/16/19/28/34/35/36     — the servo's OWN overload, overcurrent and
+#:                               thermal protection: the net any stall-probe
+#:                               design depends on
+#:
+#: EEPROM also has a finite write count, so an accidental loop wears it out.
+EEPROM_BOUNDARY = 40
+
+#: RAM, but it gates whether EEPROM writes persist — never written here.
+SCS_REG_LOCK = 55
+
+
+def _reject_eeprom_write(register: int) -> None:
+    """Refuse to write anywhere that could permanently alter the servo."""
+    if register < EEPROM_BOUNDARY:
+        raise ValueError(
+            f"refusing to write register {register}: below {EEPROM_BOUNDARY} is "
+            f"EEPROM (id, baud, limits, offsets, protection thresholds) and the "
+            f"change would be permanent"
+        )
+    if register == SCS_REG_LOCK:
+        raise ValueError("refusing to write register 55 (Lock): it controls "
+                         "whether EEPROM writes persist")  # 12-bit encoder, but reg is 16-bit; allow 0..4095 for SO-ARM101
 
 
 class SCSProtocol:
@@ -37,6 +73,7 @@ class SCSProtocol:
         """Write Goal_Position on `motor_id`. `ticks` must be 0..SCS_TICKS_MAX."""
         if not 0 <= ticks <= SCS_TICKS_MAX:
             raise ValueError(f"ticks {ticks} outside 0..{SCS_TICKS_MAX}")
+        _reject_eeprom_write(SCS_REG_GOAL_POSITION)
         params = bytes([SCS_REG_GOAL_POSITION, ticks & 0xFF, (ticks >> 8) & 0xFF])
         pkt = _build_packet(
             motor_id=motor_id,

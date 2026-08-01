@@ -10,6 +10,7 @@ from typing import TypedDict
 from robot_md_gateway.actuator import ActuatorOutcome
 
 from so_arm101_actuator import config
+from so_arm101_actuator import config as _config_module
 from so_arm101_actuator.errors import (
     UnknownJointError,
     OutOfRangeError,
@@ -121,16 +122,24 @@ class SOArm101Actuator:
         # this the gripper's zero is assumed to be 2048 when it is really 1539,
         # which puts every reading outside the joint's own range and gets it
         # excluded from motion as if the hardware were faulty.
+        #: True only when the manifest supplied this joint's real zero. The
+        #: fallback constant (2048) is wrong for the gripper on this arm, so
+        #: motion stays disabled rather than trusting a guess.
+        self._gripper_calibrated = False
         try:
             config.apply_manifest_calibration()
+            self._gripper_calibrated = config.gripper_geometry_known()
         except Exception:
             # Geometry we cannot read is not a reason to refuse to run; the
             # constants remain a workable fallback.
             pass
+        #: A caller's explicit pose outranks anything read from a manifest, and
+        #: must survive the re-read that happens when execute() supplies one.
+        self._home_pose_override = dict(home_pose_rad) if home_pose_rad else None
         env_pose = config.resolve_home_pose_rad()
-        if home_pose_rad is not None:
+        if self._home_pose_override:
             # kwarg merges on top of env-resolved pose (kwarg wins per joint)
-            env_pose = {**env_pose, **home_pose_rad}
+            env_pose = {**env_pose, **self._home_pose_override}
         self.home_pose_rad: dict[str, float] = env_pose
 
         env_tolerance = config.resolve_move_tolerance_rad()
@@ -202,6 +211,44 @@ class SOArm101Actuator:
         """Move all joints to the resolved home pose (env/kwarg-overridable)."""
         return self.move(self.home_pose_rad, timeout_s=timeout_s)
 
+    def _apply_manifest(self, manifest_path) -> None:
+        """Re-read geometry from a specific manifest, at most once per path.
+
+        Idempotent and cheap after the first call. Failure is not fatal: geometry
+        we cannot read leaves the generic constants in place, and the gripper
+        stays out of motion because its fallback zero is wrong for this arm.
+        """
+        key = str(manifest_path) if manifest_path else ""
+        if not key or key == getattr(self, "_manifest_applied", None):
+            return
+        try:
+            _config_module.apply_manifest_calibration(key)
+            self._gripper_calibrated = _config_module.gripper_geometry_known(key)
+            # The taught pose is stored in TICKS, so correcting the zeros changes
+            # which radians mean that pose. Recompute, keeping any caller override.
+            pose = _config_module.resolve_home_pose_rad(key)
+            if self._home_pose_override:
+                pose = {**pose, **self._home_pose_override}
+            self.home_pose_rad = pose
+            self._manifest_applied = key
+        except Exception:
+            pass
+
+    def _home_pose_for_motion(self) -> dict:
+        """The taught home pose, including the gripper only if we know its zero.
+
+        The gripper used to be excluded unconditionally, and that was right at
+        the time: this module assumed a tick zero of 2048 while the manifest
+        declares 1539, so every radian sent to it meant something else. Reading
+        the manifest fixed the conversion, so the exclusion now only applies
+        when the manifest could not be read at all — in which case the fallback
+        constant is wrong again and the old caution still holds.
+        """
+        pose = dict(self.home_pose_rad)
+        if not self._gripper_calibrated:
+            pose.pop("gripper", None)
+        return pose
+
     def read_state(self) -> ActuatorState:
         """Read all joint positions and motor temperatures (best-effort).
 
@@ -245,6 +292,13 @@ class SOArm101Actuator:
         error ``ActuatorOutcome`` so the gateway audit chain always receives a
         structured result.
         """
+        # The manifest that authorized THIS call is the authoritative source for
+        # this robot's geometry. __init__ also tries, but only via $ROBOT_MANIFEST,
+        # and nothing in the deployed services sets it — so relying on __init__
+        # alone left the correction inert everywhere except a shell that happened
+        # to export it. The gateway always knows the manifest; use it.
+        self._apply_manifest(manifest_path)
+
         tool_name = envelope.get("tool_name")
         tool_args = envelope.get("tool_args", {}) or {}
 
@@ -269,9 +323,7 @@ class SOArm101Actuator:
         # stay unmapped: they need the vision rig, and the gateway deny-lists
         # them via ROBOT_MD_TOOL_ALLOWLIST so clients get a signed DENY instead.
         if tool_name == "arm.home":
-            # Five-joint home: the gripper's tick zero is contested between the
-            # manifest (1539) and this module's 2048 assumption — never command it.
-            pose = {j: r for j, r in self.home_pose_rad.items() if j != "gripper"}
+            pose = self._home_pose_for_motion()
             tool_name, tool_args = "move", {"joint_positions": pose}
         elif tool_name == "status.report":
             tool_name, tool_args = "read_state", {}
@@ -283,7 +335,7 @@ class SOArm101Actuator:
                     outcome_kind="error",
                     error_message=f"unknown reach target: {target!r}",
                 )
-            reach_pose = {j: r for j, r in self.home_pose_rad.items() if j != "gripper"}
+            reach_pose = self._home_pose_for_motion()
             reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
             tool_name, tool_args = "move", {"joint_positions": reach_pose}
         method = {
