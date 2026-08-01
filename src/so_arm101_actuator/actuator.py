@@ -29,6 +29,27 @@ class ActuatorState(TypedDict):
     timestamp_s: float
 
 
+def _open_serial(port: str, baud: int, timeout: float = 0.1):
+    """Open the servo bus WITHOUT asserting DTR/RTS.
+
+    pyserial raises both on open, which is exactly esptool's
+    reset-into-download-mode sequence on an ESP32 native-USB CDC. If a port is
+    ever mis-identified — and a LoRa dev board next to a robot arm is the common
+    case, not the edge case — opening it should fail harmlessly rather than
+    reboot the other device.
+    """
+    import serial
+
+    handle = serial.Serial()
+    handle.port = port
+    handle.baudrate = baud
+    handle.timeout = timeout
+    handle.dtr = False
+    handle.rts = False
+    handle.open()
+    return handle
+
+
 #: One servo bus, one caller at a time. The gateway serves /v1/invoke from a
 #: threadpool, so two overlapping requests previously interleaved reads and
 #: writes on the same unlocked pyserial handle and BOTH returned HTTP 500
@@ -95,6 +116,17 @@ class SOArm101Actuator:
                 tolerance (from environment SO_ARM101_MOVE_TOLERANCE_RAD or
                 config.MOVE_TOLERANCE_RAD). Kwarg takes precedence over env.
         """
+        # The manifest is authoritative for THIS robot's geometry; the module
+        # constants are only a fallback for a bench with no manifest. Without
+        # this the gripper's zero is assumed to be 2048 when it is really 1539,
+        # which puts every reading outside the joint's own range and gets it
+        # excluded from motion as if the hardware were faulty.
+        try:
+            config.apply_manifest_calibration()
+        except Exception:
+            # Geometry we cannot read is not a reason to refuse to run; the
+            # constants remain a workable fallback.
+            pass
         env_pose = config.resolve_home_pose_rad()
         if home_pose_rad is not None:
             # kwarg merges on top of env-resolved pose (kwarg wins per joint)
@@ -113,7 +145,7 @@ class SOArm101Actuator:
     def from_default_port(cls, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> "SOArm101Actuator":
         import serial
         from so_arm101_actuator.protocol import SCSProtocol
-        ser = serial.Serial(port=port, baudrate=baud, timeout=0.1)
+        ser = _open_serial(port, baud)
         return cls(protocol=SCSProtocol(serial=ser))
 
     def _ensure_protocol(self, *, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> None:
@@ -128,7 +160,7 @@ class SOArm101Actuator:
         import serial
         from so_arm101_actuator.protocol import SCSProtocol
         self._protocol = SCSProtocol(
-            serial=serial.Serial(port=port, baudrate=baud, timeout=0.1)
+            serial=_open_serial(port, baud)
         )
 
     def move(self, joint_positions: dict[str, float], *, timeout_s: float = 5.0) -> MoveResult:

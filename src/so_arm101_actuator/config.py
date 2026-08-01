@@ -9,6 +9,7 @@ from __future__ import annotations
 import json as _json
 import math
 import os as _os
+from pathlib import Path as _Path
 from typing import TypedDict
 
 from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
@@ -58,13 +59,140 @@ def ticks_to_rad(joint: str, ticks: int) -> float:
     return (ticks - spec["tick_at_zero_rad"]) / spec["ticks_per_rad"]
 
 
+#: Where the robot's own manifest lives, when one is configured. The manifest is
+#: AUTHORITATIVE for this robot's geometry; the constants above are only a
+#: fallback for a bench with no manifest at all.
+MANIFEST_ENV = "ROBOT_MANIFEST"
+
+
+def load_manifest_calibration(path: str | None = None) -> dict:
+    """Per-joint zero and gripper span, read from the robot's signed ROBOT.md.
+
+    This exists because the constants above are GENERIC and this robot is not.
+    `tick_at_zero_rad = 2048` is a sensible default for a servo at mid-travel,
+    but Bob's gripper zero is 1539 and its jaws only span ticks 1200-1700 — so
+    the generic zero puts every real reading far outside the joint's own safe
+    range, and the gripper gets excluded from motion as if it were faulty.
+
+    The manifest already carries the right numbers (`zero_pose_steps` per joint,
+    plus `physics.gripper.open_steps` / `close_steps`). Reading them is a pure
+    software fix: no motion, no probing, nothing to damage.
+    """
+    source = path or _os.environ.get(MANIFEST_ENV, "")
+    if not source:
+        return {}
+    try:
+        text = _Path(source).read_text()
+    except OSError:
+        return {}
+    if not text.startswith("---"):
+        return {}
+    end = text.find("\n---", 3)
+    if end == -1:
+        return {}
+    try:
+        import yaml
+
+        front = yaml.safe_load(text[3:end]) or {}
+    except Exception:
+        return {}
+
+    out: dict = {"zeros": {}, "gripper": {}}
+    # Both live under `physics` in an RCAN v3 manifest — kinematics directly,
+    # and the gripper's jaw travel under the solver block.
+    physics = front.get("physics") or {}
+    for joint in (physics.get("kinematics") or []):
+        if isinstance(joint, dict) and "id" in joint and "zero_pose_steps" in joint:
+            try:
+                out["zeros"][str(joint["id"])] = int(joint["zero_pose_steps"])
+            except (TypeError, ValueError):
+                continue
+    # The taught pose, in TICKS. Ticks are what the servo actually accepts, so a
+    # pose expressed this way is independent of whatever zero convention the
+    # driver happens to use — which is exactly the bug being fixed here.
+    ready = ((physics.get("poses") or {}).get("ready") or {}).get("joints") or {}
+    if isinstance(ready, dict):
+        out["ready_ticks"] = {str(k): int(v) for k, v in ready.items()
+                              if isinstance(v, (int, float))}
+
+    gripper = ((physics.get("solver") or {}).get("gripper") or {})
+    for key in ("open_steps", "close_steps"):
+        if key in gripper:
+            try:
+                out["gripper"][key] = int(gripper[key])
+            except (TypeError, ValueError):
+                pass
+    return out
+
+
+def apply_manifest_calibration(path: str | None = None) -> dict:
+    """Fold the manifest's geometry into JOINTS and SAFE_RANGE_RAD.
+
+    Returns a summary of what changed so a caller can report it honestly rather
+    than silently altering how the arm interprets every position.
+    """
+    data = load_manifest_calibration(path)
+    if not data:
+        return {}
+    changed: dict = {"zeros": {}, "safe_range": {}}
+
+    for joint, zero in data.get("zeros", {}).items():
+        spec = JOINTS.get(joint)
+        if spec is None or spec["tick_at_zero_rad"] == zero:
+            continue
+        changed["zeros"][joint] = {"was": spec["tick_at_zero_rad"], "now": zero}
+        spec["tick_at_zero_rad"] = zero
+
+    # The gripper's usable range is its declared jaw travel, expressed against
+    # its own (now correct) zero — not the generic +/-0.5 rad guess.
+    grip = data.get("gripper", {})
+    if "open_steps" in grip and "close_steps" in grip and "gripper" in JOINTS:
+        zero = JOINTS["gripper"]["tick_at_zero_rad"]
+        tpr = JOINTS["gripper"]["ticks_per_rad"]
+        lo = (min(grip["close_steps"], grip["open_steps"]) - zero) / tpr
+        hi = (max(grip["close_steps"], grip["open_steps"]) - zero) / tpr
+        changed["safe_range"]["gripper"] = {"was": SAFE_RANGE_RAD.get("gripper"),
+                                            "now": (round(lo, 4), round(hi, 4))}
+        SAFE_RANGE_RAD["gripper"] = (lo, hi)
+        # Mechanical limits must at least contain the declared travel, or a
+        # legitimate commanded position would be rejected as out of range.
+        JOINTS["gripper"]["min_rad"] = min(JOINTS["gripper"]["min_rad"], lo)
+        JOINTS["gripper"]["max_rad"] = max(JOINTS["gripper"]["max_rad"], hi)
+    return changed
+
+
+def manifest_home_pose_rad(path: str | None = None) -> dict[str, float]:
+    """The manifest's taught `ready` pose, in radians against the CURRENT zeros.
+
+    Prefer this over any hand-tuned radian constant. A radian value is only
+    meaningful relative to a zero, so a pose tuned against the wrong zero moves
+    the arm somewhere else the moment the zero is corrected — here, 182 ticks
+    (~16 degrees) of shoulder_lift. Reading the taught pose in ticks and
+    converting through the corrected zeros round-trips exactly.
+    """
+    data = load_manifest_calibration(path)
+    ticks = data.get("ready_ticks") or {}
+    return {joint: ticks_to_rad(joint, value)
+            for joint, value in ticks.items() if joint in JOINTS}
+
+
 def resolve_home_pose_rad() -> dict[str, float]:
     """Return HOME_POSE_RAD merged with SO_ARM101_HOME_POSE_RAD env override.
 
     Env value MUST be JSON object {joint: rad}. Partial overrides merge with
     HOME_POSE_RAD defaults. Unknown joint names raise ValueError.
     """
+    # Prefer the manifest's taught pose. It is stored in TICKS, so it stays
+    # correct no matter what zero convention the driver uses — unlike a radian
+    # constant, which silently means something different the moment a zero is
+    # corrected.
     base: dict[str, float] = dict(HOME_POSE_RAD)
+    try:
+        taught = manifest_home_pose_rad()
+        if taught:
+            base.update(taught)
+    except Exception:
+        pass
     raw = _os.environ.get("SO_ARM101_HOME_POSE_RAD")
     if raw is None:
         return base
