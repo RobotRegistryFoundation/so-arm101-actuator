@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os as _os
 import time
 
 from unittest.mock import MagicMock
@@ -269,3 +270,88 @@ def test_a_move_that_genuinely_fails_still_reports_false():
     result = actuator.move({"wrist_flex": 0.60}, timeout_s=0.2)
     assert result["reached"] is False
     assert result["max_error_rad"] > actuator.move_tolerance_rad
+
+
+class _ServoSim:
+    """A servo bus that actually moves toward whatever it is told.
+
+    Enough to exercise the reach loop end to end without hardware: set_position
+    stores the goal and read_position returns it, so the loop sees its own
+    commands take effect exactly as a real, fast servo would.
+    """
+
+    def __init__(self, start_ticks: int = 2048):
+        self.pos = {i: start_ticks for i in range(1, 7)}
+
+    def set_position(self, motor_id, ticks):
+        self.pos[motor_id] = int(ticks)
+
+    def read_position(self, motor_id):
+        return self.pos[motor_id]
+
+    def read_temperature(self, motor_id):
+        return 30
+
+
+def _manifest_available() -> bool:
+    return _os.path.exists("/home/craigm26/bob/ROBOT.md")
+
+
+def test_reach_point_converges_on_a_reachable_target():
+    """The whole point: get to a coordinate without solving inverse kinematics.
+
+    The analytic IK constrains the tool axis to vertical, which this arm cannot
+    achieve at tabletop reach — zero of 10,780 sampled workspace points solve
+    inside its joint limits. Measuring and stepping has no such constraint.
+    """
+    if not _manifest_available():
+        import pytest
+        pytest.skip("this robot's manifest is not on this machine")
+    from so_arm101_actuator import kinematics as kin
+
+    manifest = "/home/craigm26/bob/ROBOT.md"
+    actuator = SOArm101Actuator(protocol=_ServoSim())
+    actuator._apply_manifest(manifest)
+
+    # A target we know is reachable: the tip position of some other valid pose.
+    target = kin.tip_position_mm(
+        {"shoulder_pan": 0.20, "shoulder_lift": 0.50, "elbow_flex": 0.35,
+         "wrist_flex": -0.30, "wrist_roll": 0.0}, manifest)
+
+    result = actuator.reach_point(target, tolerance_mm=5.0)
+    assert result["arrived"] is True, f"did not converge: {result}"
+    assert result["error_mm"] <= 5.0
+    # Error must decrease overall, not wander.
+    assert result["error_history"][-1] < result["error_history"][0]
+
+
+def test_reach_point_refuses_a_target_outside_the_workspace():
+    if not _manifest_available():
+        import pytest
+        pytest.skip("this robot's manifest is not on this machine")
+    actuator = SOArm101Actuator(protocol=_ServoSim())
+    actuator._apply_manifest("/home/craigm26/bob/ROBOT.md")
+    import pytest
+    # Beyond the sum of the link lengths — physically impossible, not a policy call.
+    with pytest.raises(OutOfRangeError):
+        actuator.reach_point((2000.0, 0.0, 0.0))
+
+
+def test_reach_point_gives_up_when_it_stops_making_progress():
+    """A blocked arm must stop commanding, not press until a servo cooks."""
+    if not _manifest_available():
+        import pytest
+        pytest.skip("this robot's manifest is not on this machine")
+
+    class Stuck(_ServoSim):
+        def set_position(self, motor_id, ticks):
+            pass  # accepts commands, never moves
+
+    actuator = SOArm101Actuator(protocol=Stuck())
+    actuator._apply_manifest("/home/craigm26/bob/ROBOT.md")
+    result = actuator.reach_point((300.0, 50.0, -100.0), tolerance_mm=1.0,
+                                  max_iterations=25)
+    assert result["arrived"] is False
+    assert "stopped getting closer" in result["stopped_because"]
+    # Must bail early rather than burn every iteration against an immovable arm.
+    assert result["iterations"] < 10

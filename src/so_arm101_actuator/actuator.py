@@ -68,7 +68,7 @@ _BUS_LOCK = threading.Lock()
 #: calibrated gripper) are deliberately absent: allowing one through policy
 #: would turn a clean signed DENY into a confusing actuator 500.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
-    "arm.home", "arm.reach", "status.report",
+    "arm.home", "arm.reach", "status.report", "arm.reach_point",
 })
 
 
@@ -84,6 +84,7 @@ REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "home": frozenset({"actuate", "commission"}),
     "status.report": frozenset({"read", "actuate", "commission"}),
     "read_state": frozenset({"read", "actuate", "commission"}),
+    "arm.reach_point": frozenset({"actuate", "commission"}),
 }
 
 
@@ -131,6 +132,7 @@ class SOArm101Actuator:
         #: fallback constant (2048) is wrong for the gripper on this arm, so
         #: motion stays disabled rather than trusting a guess.
         self._gripper_calibrated = False
+        self._manifest_applied = None
         try:
             config.apply_manifest_calibration()
             self._gripper_calibrated = config.gripper_geometry_known()
@@ -258,6 +260,81 @@ class SOArm101Actuator:
         except Exception:
             pass
 
+    def reach_point(self, target_mm, *, tolerance_mm: float = 5.0,
+                    max_iterations: int = 25) -> dict:
+        """Move the gripper tip to a point, by measuring rather than solving.
+
+        Each iteration reads where the tip actually is, takes one BOUNDED step
+        that shrinks the error, and looks again. No inverse kinematics: the
+        analytic solver on this arm constrains the tool axis to vertical, which
+        it cannot achieve at tabletop reach, so it solves nothing anywhere in the
+        declared workspace.
+
+        Measuring instead of solving also means the loop corrects for a model
+        that disagrees with the hardware — and this robot's does, reporting a tip
+        20 cm below its own base. A solver would confidently command that error;
+        a servo loop converges anyway, because it steers on the encoders.
+
+        Stops early when progress stalls. An arm pressed against something it
+        cannot move keeps reporting the same error, and continuing to command
+        into it is how a servo is cooked.
+        """
+        from so_arm101_actuator import kinematics as kin
+
+        target = tuple(float(v) for v in target_mm)
+        ok, why = kin.reachable(target, self._manifest_applied)
+        if not ok:
+            raise OutOfRangeError(why)
+
+        history = []
+        last_error = None
+        stalled = 0
+
+        for step in range(max_iterations):
+            current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+            proposed, error = kin.reach_step(current, target,
+                                             manifest_path=self._manifest_applied)
+            history.append(round(error, 2))
+
+            if error <= tolerance_mm:
+                return {"arrived": True, "error_mm": round(error, 2),
+                        "iterations": step, "error_history": history,
+                        "final_positions": current}
+
+            # Stalling is measured RELATIVELY, not as a fixed millimetre gain.
+            # Gradient descent converges asymptotically, so the improvement per
+            # step shrinks as it closes in — an absolute threshold declares a
+            # healthy loop "stuck" precisely when it is nearly there. This
+            # loop reached 10mm from 325mm and was then called blocked.
+            if last_error is not None and (last_error - error) < max(0.05, last_error * 0.02):
+                stalled += 1
+                if stalled >= 3:
+                    return {"arrived": False, "error_mm": round(error, 2),
+                            "iterations": step, "error_history": history,
+                            "stopped_because": ("stopped getting closer — the arm may be "
+                                                "blocked, or this point may not be "
+                                                "reachable at this approach angle"),
+                            "final_positions": current}
+            else:
+                stalled = 0
+            last_error = error
+
+            # Every commanded angle stays inside the joint's own safe range; the
+            # servo loop must not be able to walk the arm past its limits.
+            safe = {}
+            for joint, value in proposed.items():
+                lo, hi = config.SAFE_RANGE_RAD.get(joint, (-3.14, 3.14))
+                safe[joint] = max(lo, min(hi, value))
+            self.move(safe, timeout_s=3.0)
+
+        current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+        final_error = kin.reach_step(current, target,
+                                     manifest_path=self._manifest_applied)[1]
+        return {"arrived": False, "error_mm": round(final_error, 2),
+                "iterations": max_iterations, "error_history": history,
+                "stopped_because": "ran out of iterations",
+                "final_positions": current}
+
     def _home_pose_for_motion(self) -> dict:
         """The taught home pose, including the gripper only if we know its zero.
 
@@ -349,6 +426,24 @@ class SOArm101Actuator:
         if tool_name == "arm.home":
             pose = self._home_pose_for_motion()
             tool_name, tool_args = "move", {"joint_positions": pose}
+        elif tool_name == "arm.reach_point":
+            target = tool_args.get("target_mm")
+            if not target or len(target) != 3:
+                return ActuatorOutcome(
+                    success=False, outcome_kind="error",
+                    error_message="arm.reach_point needs target_mm as [x, y, z]")
+            try:
+                telemetry = self.reach_point(
+                    target,
+                    tolerance_mm=float(tool_args.get("tolerance_mm", 5.0)))
+            except Exception as exc:
+                return ActuatorOutcome(success=False, outcome_kind="error",
+                                       error_message=f"{type(exc).__name__}: {exc}")
+            return ActuatorOutcome(
+                success=bool(telemetry.get("arrived")),
+                outcome_kind="executed" if telemetry.get("arrived") else "error",
+                telemetry=telemetry,
+                error_message=telemetry.get("stopped_because"))
         elif tool_name == "status.report":
             tool_name, tool_args = "read_state", {}
         elif tool_name == "arm.reach":
