@@ -22,6 +22,11 @@ class MoveResult(TypedDict):
     reached: bool
     final_positions: dict[str, float]
     elapsed_s: float
+    #: Worst per-joint distance from target in the RETURNED snapshot. Present so
+    #: a caller can tell "missed by a hair" from "never left the parking spot" —
+    #: a bare False says a move failed without saying by how much, which reads as
+    #: a broken robot when the arm is a hundredth of a radian off.
+    max_error_rad: float
 
 
 class ActuatorState(TypedDict):
@@ -201,10 +206,29 @@ class SOArm101Actuator:
 
         # Snapshot final state for *all* commanded joints.
         final = {j: self._read_joint(j) for j in joint_positions}
+
+        # Recompute against the snapshot actually being RETURNED, rather than
+        # trusting the loop's verdict.
+        #
+        # The loop polls, then this reads again. An arm that settled in the gap
+        # between the last poll and this read produced a receipt asserting
+        # reached=False while final_positions showed every joint on target — the
+        # same receipt disagreeing with itself. Observed on real hardware: a
+        # wrist_flex move reported failure, and the next command read the joint
+        # sitting 0.03 rad from where it had been asked to go, well inside a 0.05
+        # tolerance.
+        #
+        # That matters more than it sounds. These receipts are signed evidence,
+        # and a saved capability replaying them would look broken on every run.
+        errors = {j: abs(final[j] - joint_positions[j]) for j in joint_positions}
+        max_error = max(errors.values()) if errors else 0.0
+        reached = max_error <= self.move_tolerance_rad
+
         return MoveResult(
             reached=reached,
             final_positions=final,
             elapsed_s=time.monotonic() - start,
+            max_error_rad=round(max_error, 5),
         )
 
     def home(self, *, timeout_s: float = 10.0) -> MoveResult:

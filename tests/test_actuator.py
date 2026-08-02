@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 from unittest.mock import MagicMock
 
 import pytest
@@ -198,3 +200,72 @@ def test_execute_actuator_exception_becomes_error_outcome():
     assert outcome.success is False
     assert outcome.outcome_kind == "error"
     assert "UnknownJointError" in outcome.error_message
+
+
+def test_reached_agrees_with_the_positions_in_the_same_result():
+    """A receipt must not assert failure while reporting arrival.
+
+    The poll loop and the final snapshot are two separate reads. An arm that
+    settles between them used to produce reached=False alongside
+    final_positions showing every joint on target — one receipt contradicting
+    itself. Seen on hardware: a wrist_flex move reported failure and the joint
+    was later found 0.03 rad from target, well inside the 0.05 tolerance.
+
+    These receipts are signed evidence and a saved capability replays them, so a
+    macro that worked would look broken on every single run.
+    """
+    from pathlib import Path
+
+    class ArrivesAfterTheLoopGivesUp:
+        """Reports the old position while polled, the new one when finally read.
+
+        Switches on ELAPSED TIME rather than a read count, so it arrives in the
+        gap between the loop timing out and the closing snapshot regardless of
+        how many times the loop happens to poll.
+        """
+
+        def __init__(self, target_ticks: int, arrive_after_s: float):
+            self._target = target_ticks
+            self._arrive_at = time.monotonic() + arrive_after_s
+
+        def set_position(self, motor_id, ticks):
+            pass
+
+        def read_position(self, motor_id):
+            return self._target if time.monotonic() >= self._arrive_at else 2048
+
+        def read_temperature(self, motor_id):
+            return 30
+
+    from so_arm101_actuator import config as cfg
+    target_rad = 0.30
+    target_ticks = cfg.rad_to_ticks("wrist_flex", target_rad)
+    # Arrive just after the 0.25s loop gives up, i.e. inside the gap.
+    actuator = SOArm101Actuator(
+        protocol=ArrivesAfterTheLoopGivesUp(target_ticks, arrive_after_s=0.26))
+
+    result = actuator.move({"wrist_flex": target_rad}, timeout_s=0.25)
+
+    on_target = abs(result["final_positions"]["wrist_flex"] - target_rad)
+    assert on_target <= actuator.move_tolerance_rad, "test fixture did not actually arrive"
+    assert result["reached"] is True, (
+        "receipt says the move failed while its own final_positions show arrival")
+    assert result["max_error_rad"] <= actuator.move_tolerance_rad
+
+
+def test_a_move_that_genuinely_fails_still_reports_false():
+    """The fix must not turn every move into a success."""
+    class NeverMoves:
+        def set_position(self, motor_id, ticks):
+            pass
+
+        def read_position(self, motor_id):
+            return 2048
+
+        def read_temperature(self, motor_id):
+            return 30
+
+    actuator = SOArm101Actuator(protocol=NeverMoves())
+    result = actuator.move({"wrist_flex": 0.60}, timeout_s=0.2)
+    assert result["reached"] is False
+    assert result["max_error_rad"] > actuator.move_tolerance_rad
