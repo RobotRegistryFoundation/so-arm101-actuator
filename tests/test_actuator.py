@@ -117,8 +117,12 @@ def test_zero_arg_instantiation():
 
 
 def test_capabilities_tuple_unchanged():
+    """The three original verbs must stay, in place, at the front: the tuple is
+    read positionally nowhere we control, and removing or reordering one would
+    be a silent API break. Appending is how it grows."""
     actuator, _ = _make_actuator()
-    assert actuator.capabilities == ("move", "home", "read_state")
+    assert actuator.capabilities[:3] == ("move", "home", "read_state")
+    assert actuator.capabilities == ("move", "home", "read_state", "move_to", "state")
 
 
 def test_implements_actuator_protocol():

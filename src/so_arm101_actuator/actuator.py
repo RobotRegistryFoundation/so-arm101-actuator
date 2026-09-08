@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
 from pathlib import Path
@@ -11,11 +12,30 @@ from robot_md_gateway.actuator import ActuatorOutcome
 
 from so_arm101_actuator import config
 from so_arm101_actuator import config as _config_module
+from so_arm101_actuator import kinematics as kin
 from so_arm101_actuator.errors import (
+    DeniedError,
     UnknownJointError,
     OutOfRangeError,
     ActuatorTimeoutError,
 )
+
+
+#: Default `speed` for arm.move_to when the caller does not say. 1.0 is one
+#: direct position command, which is exactly what arm.home and arm.reach have
+#: always done — a slower default would quietly change how every existing
+#: motion on this arm behaves.
+DEFAULT_SPEED = 1.0
+
+#: Most interpolation waypoints a single move_to will command. The bus is
+#: position-only, so "slower" is spelled as "more, smaller commands"; past a
+#: dozen the extra round-trips cost more time than the motion they pace.
+MAX_WAYPOINTS = 10
+
+#: How long an intermediate waypoint is given to settle. Deliberately short:
+#: waypoints are a pacing device, not targets to converge on, and the final
+#: command is the one that has to arrive.
+WAYPOINT_TIMEOUT_S = 1.5
 
 
 class MoveResult(TypedDict):
@@ -33,6 +53,41 @@ class ActuatorState(TypedDict):
     positions: dict[str, float]
     motor_temps_c: dict[str, float]
     timestamp_s: float
+
+
+class MoveToResult(TypedDict):
+    """Telemetry for one Cartesian move. The four keys an evaluation harness
+    reads — ``reached``, ``final_positions``, ``eef_mm``, ``elapsed_s`` — come
+    first; the rest exist so a receipt can be argued with rather than believed.
+    """
+
+    reached: bool
+    final_positions: dict[str, float]
+    eef_mm: dict[str, float]
+    elapsed_s: float
+    #: Worst per-joint miss against the commanded pose, from the same snapshot
+    #: `final_positions` reports (see the note in `move`).
+    max_error_rad: float
+    #: Distance from the tip to the requested point, by forward kinematics on
+    #: the pose that was actually reached. `reached` is a JOINT-space verdict;
+    #: this is the Cartesian one, and they can disagree.
+    error_mm: float
+    target_mm: dict[str, float]
+    speed: float
+    waypoints: int
+    ik_provider: str
+
+
+class ArmState(TypedDict):
+    """Read-only pose snapshot. `eef_mm` is None only when the manifest
+    declares no chain to walk — the joint angles are still reported, because a
+    read that refuses to say where the joints are is useless exactly when it is
+    most needed.
+    """
+
+    joint_positions_rad: dict[str, float]
+    eef_mm: dict[str, float] | None
+    tool: str | None
 
 
 def _open_serial(port: str, baud: int, timeout: float = 0.1):
@@ -69,6 +124,7 @@ _BUS_LOCK = threading.Lock()
 #: would turn a clean signed DENY into a confusing actuator 500.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
     "arm.home", "arm.reach", "status.report", "arm.reach_point",
+    "arm.move_to", "arm.state",
 })
 
 
@@ -85,7 +141,66 @@ REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "status.report": frozenset({"read", "actuate", "commission"}),
     "read_state": frozenset({"read", "actuate", "commission"}),
     "arm.reach_point": frozenset({"actuate", "commission"}),
+    # Cartesian motion is motion: same tier class as arm.reach.
+    "arm.move_to": frozenset({"actuate", "commission"}),
+    "move_to": frozenset({"actuate", "commission"}),
+    # Reading a pose moves nothing: same tier class as status.report.
+    "arm.state": frozenset({"read", "actuate", "commission"}),
+    "state": frozenset({"read", "actuate", "commission"}),
 }
+
+
+def _denied(exc: DeniedError) -> ActuatorOutcome:
+    """Turn a refusal into the outcome the gateway signs and returns as a 403.
+
+    The structured form rides in ``telemetry`` as well as in the message. The
+    gateway hashes telemetry into the signed receipt either way, so a harness
+    reading ``deny``/``reason`` gets a machine-readable refusal that is bound to
+    the same signature the human-readable one is.
+    """
+    return ActuatorOutcome(
+        success=False,
+        outcome_kind="denied",
+        error_message=str(exc),
+        telemetry={"deny": exc.code, "reason": exc.detail},
+    )
+
+
+def _parse_move_to_args(tool_args: dict) -> dict:
+    """Validate `arm.move_to`'s wire arguments into keyword arguments.
+
+    Strict on purpose. A missing coordinate is not zero, an unknown argument is
+    not ignorable (a caller who wrote ``z`` instead of ``z_mm`` means to move
+    somewhere, and silently dropping it moves the arm somewhere else), and a
+    string "150" is a client that has not decided what its numbers are.
+    """
+    coords: dict[str, float] = {}
+    for name in ("x_mm", "y_mm", "z_mm"):
+        if name not in tool_args:
+            raise DeniedError(
+                "bad_args",
+                f"arm.move_to needs x_mm, y_mm and z_mm (millimetres in the arm's "
+                f"base frame: z up, x forward); {name} is missing")
+        value = tool_args[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise DeniedError(
+                "bad_args", f"{name} must be a number, got {value!r}")
+        if not math.isfinite(float(value)):
+            raise DeniedError("bad_args", f"{name} must be finite, got {value!r}")
+        coords[name] = float(value)
+
+    unknown = sorted(set(tool_args) - {"x_mm", "y_mm", "z_mm", "speed"})
+    if unknown:
+        raise DeniedError(
+            "bad_args",
+            f"arm.move_to does not take {', '.join(unknown)}; it accepts x_mm, "
+            f"y_mm, z_mm and an optional speed")
+
+    speed = tool_args.get("speed", DEFAULT_SPEED)
+    # Validated here as well as in _waypoint_count so a malformed speed is
+    # refused before the serial port is opened.
+    SOArm101Actuator._waypoint_count(speed)
+    return {**coords, "speed": float(speed)}
 
 
 class SOArm101Actuator:
@@ -99,7 +214,7 @@ class SOArm101Actuator:
     description = "SO-ARM101 6-DOF + gripper Actuator Protocol driver. RPN-000000000002."
     config_schema: dict = {}
 
-    capabilities = ("move", "home", "read_state")
+    capabilities = ("move", "home", "read_state", "move_to", "state")
 
     def __init__(
         self,
@@ -335,6 +450,189 @@ class SOArm101Actuator:
                 "stopped_because": "ran out of iterations",
                 "final_positions": current}
 
+    # ----------------------------------------------------------------- #
+    # Cartesian control (arm.move_to / arm.state)
+    # ----------------------------------------------------------------- #
+
+    def move_to(self, *, x_mm: float, y_mm: float, z_mm: float,
+                speed: float = DEFAULT_SPEED,
+                timeout_s: float = 6.0) -> MoveToResult:
+        """Put the tool tip at (x, y, z) in the arm's BASE frame, tool down.
+
+        Distinct from :meth:`reach_point` on purpose, and both are worth having:
+
+          * ``reach_point`` MEASURES — it steps toward the target reading the
+            encoders each time, imposes nothing on tool orientation, and gets
+            there at whatever tilt the arm can manage. It is how you touch a
+            thing.
+          * ``move_to`` SOLVES — one analytic answer, tool vertical, checked
+            against the limits before anything moves, and refused outright if
+            the answer is not one this arm may hold. It is how an evaluation
+            harness asks for a pose it can reason about afterwards.
+
+        Every refusal is a :class:`DeniedError`, which the gateway turns into a
+        signed 403. Nothing is clamped: a target that needs a joint past its
+        limit is not quietly turned into the nearest legal pose, because that
+        pose puts the tip somewhere the caller did not ask for and the receipt
+        would say it succeeded.
+
+        The refusals, in the order they are made — cheapest and most decisive
+        first, so a bad target costs no bus traffic at all:
+
+        ``out_of_workspace``   outside the manifest's declared envelope
+        ``unreachable``        the links do not span it, tool vertical
+        ``joint_limits``       solvable, but outside the DECLARED limits
+        ``frame_disagreement`` the solve and forward kinematics disagree
+        ``unsafe_pose``        inside declared limits, outside this rig's
+                               MEASURED envelope (config.SAFE_RANGE_RAD)
+        ``unsafe_start``       the arm is parked outside that envelope, so no
+                               straight line from here stays inside it
+
+        ``speed`` (0, 1] paces the motion. The servo bus this driver owns takes
+        Goal_Position and nothing else — there is no velocity register in
+        ``protocol.py`` and adding one is a hardware change, not a software one
+        — so speed is spelled as joint-space interpolation: ``ceil(1/speed)``
+        waypoints along the straight line from here to there. 1.0 is one direct
+        command, exactly what every other motion on this arm already does.
+        """
+        manifest = self._manifest_applied
+        target = (float(x_mm), float(y_mm), float(z_mm))
+        started = time.monotonic()
+
+        # 1. The declared envelope. Checked first because it is the operator's
+        #    statement about where this robot is allowed to be, and it is a
+        #    lookup rather than a solve.
+        inside, why = kin.within_workspace(target, manifest)
+        if not inside:
+            raise DeniedError("out_of_workspace", why)
+
+        # 2. Physics. The tip cannot be farther from the base than the links
+        #    are long, whatever the manifest's box says.
+        ok, why = kin.reachable(target, manifest)
+        if not ok:
+            raise DeniedError("unreachable", why)
+
+        # 3. The solve itself, from the provider the manifest names.
+        solution = kin.solve_tool_down(target, manifest)
+        if not solution.ok:
+            raise DeniedError(solution.code, solution.detail)
+
+        # 4. This rig's MEASURED envelope, which is tighter than the declared
+        #    one and is the check that actually protects the servos. Separate
+        #    from the solver's own limit check so the receipt can say which of
+        #    the two facts refused: a design limit, or this arm's real stops.
+        safe = config.resolve_safe_range_rad()
+        for joint, angle in solution.joints.items():
+            span = safe.get(joint)
+            if span is None:
+                continue
+            lo, hi = span
+            if not (lo <= angle <= hi):
+                raise DeniedError(
+                    "unsafe_pose",
+                    f"the tool-down solution needs {joint} at {angle:+.3f} rad, "
+                    f"outside the measured safe range [{lo:+.2f}, {hi:+.2f}] on "
+                    f"this arm. Nothing was moved and nothing was clamped: the "
+                    f"clamped pose would put the tip somewhere else entirely. "
+                    f"An operator who has re-measured this joint can widen it "
+                    f"with SO_ARM101_SAFE_RANGE_RAD.")
+
+        # Everything above is arithmetic. Only now does the bus get touched.
+        current = {joint: self._read_joint(joint)
+                   for joint in config.JOINTS if joint != "gripper"}
+
+        # 5. Both ends of the path must sit inside the safe box, or the straight
+        #    line between them does not either. The target end is already
+        #    checked; this is the start, and it fails only when the arm is
+        #    already parked somewhere it should not be — in which case the way
+        #    out is arm.home, not a Cartesian move through the bad region.
+        for joint, angle in current.items():
+            span = safe.get(joint)
+            if span is None:
+                continue
+            lo, hi = span
+            if not (lo <= angle <= hi):
+                raise DeniedError(
+                    "unsafe_start",
+                    f"the arm is parked with {joint} at {angle:+.3f} rad, outside "
+                    f"its measured safe range [{lo:+.2f}, {hi:+.2f}] — no straight "
+                    f"path from here stays inside the envelope. Run arm.home first.")
+
+        # wrist_roll is HELD, not solved: it turns about the tool axis, which is
+        # the axis every remaining link offset lies along, so it moves the tip by
+        # exactly nothing. Commanding it to some fresh value would spin whatever
+        # is in the gripper for no reason.
+        pose = dict(solution.joints)
+        pose["wrist_roll"] = current["wrist_roll"]
+
+        waypoints = self._waypoint_count(speed)
+        for index in range(1, waypoints):
+            fraction = index / waypoints
+            step = {joint: current[joint] + (pose[joint] - current[joint]) * fraction
+                    for joint in pose}
+            # Intermediate poses are a pacing device, not destinations — their
+            # `reached` verdict is deliberately ignored. Both endpoints are
+            # inside the safe box and the box is convex, so every point on this
+            # line is too.
+            self.move(step, timeout_s=WAYPOINT_TIMEOUT_S)
+
+        result = self.move(pose, timeout_s=timeout_s)
+        final = result["final_positions"]
+        tip = kin.tip_position_mm(final, manifest)
+
+        return MoveToResult(
+            reached=result["reached"],
+            final_positions=final,
+            eef_mm={"x": tip[0], "y": tip[1], "z": tip[2]},
+            elapsed_s=time.monotonic() - started,
+            max_error_rad=result["max_error_rad"],
+            error_mm=round(math.dist(tip, target), 2),
+            target_mm={"x": target[0], "y": target[1], "z": target[2]},
+            speed=float(speed),
+            waypoints=waypoints,
+            ik_provider=solution.provider,
+        )
+
+    @staticmethod
+    def _waypoint_count(speed: float) -> int:
+        """How many commands to split the path into for this speed.
+
+        Validated, never clamped: a speed of 0 means "do not move", which is not
+        a slower move but a different request, and 1.5 is a caller who thinks
+        this scale means something it does not.
+        """
+        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
+            raise DeniedError("bad_args", f"speed must be a number, got {speed!r}")
+        value = float(speed)
+        if not (0.0 < value <= 1.0):
+            raise DeniedError(
+                "bad_args",
+                f"speed must be greater than 0 and at most 1, got {value}")
+        if value >= 1.0:
+            return 1
+        return min(MAX_WAYPOINTS, math.ceil(1.0 / value))
+
+    def state(self) -> ArmState:
+        """Where every joint is, where that puts the tip, and what is on it.
+
+        Read-only in the strongest sense: it issues position reads and nothing
+        else, so it is safe to call at any tier that may observe the robot.
+        """
+        positions = {joint: self._read_joint(joint) for joint in config.JOINTS}
+        eef: dict[str, float] | None = None
+        try:
+            tip = kin.tip_position_mm(positions, self._manifest_applied)
+            eef = {"x": tip[0], "y": tip[1], "z": tip[2]}
+        except ValueError:
+            # No declared chain: we cannot say where the tip is. Say that,
+            # rather than refusing to report the joint angles we DO know.
+            eef = None
+        return ArmState(
+            joint_positions_rad=positions,
+            eef_mm=eef,
+            tool=kin.declared_tool(self._manifest_applied),
+        )
+
     def _home_pose_for_motion(self) -> dict:
         """The taught home pose, including the gripper only if we know its zero.
 
@@ -444,6 +742,17 @@ class SOArm101Actuator:
                 outcome_kind="executed" if telemetry.get("arrived") else "error",
                 telemetry=telemetry,
                 error_message=telemetry.get("stopped_because"))
+        elif tool_name == "arm.move_to":
+            # Argument shape is settled BEFORE the bus is opened: a malformed
+            # request should not cost a serial handle, and it must come back as
+            # a deny rather than as a driver crash.
+            try:
+                tool_args = _parse_move_to_args(tool_args)
+            except DeniedError as exc:
+                return _denied(exc)
+            tool_name = "move_to"
+        elif tool_name == "arm.state":
+            tool_name, tool_args = "state", {}
         elif tool_name == "status.report":
             tool_name, tool_args = "read_state", {}
         elif tool_name == "arm.reach":
@@ -461,6 +770,8 @@ class SOArm101Actuator:
             "move": self.move,
             "home": self.home,
             "read_state": self.read_state,
+            "move_to": self.move_to,
+            "state": self.state,
         }.get(tool_name)
         if method is None:
             return ActuatorOutcome(
@@ -477,6 +788,10 @@ class SOArm101Actuator:
             with _BUS_LOCK:
                 self._ensure_protocol(port=port, baud=baud)
                 result = method(**tool_args)
+        except DeniedError as exc:
+            # A refusal is a decision. It leaves the bus untouched and reaches
+            # the caller as a signed 403, not as a 500 that reads like a fault.
+            return _denied(exc)
         except (OSError, IOError) as exc:
             # The serial handle is held for the process lifetime, so a USB
             # replug leaves a dead fd that would fail every later invoke. Drop
