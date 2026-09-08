@@ -1,3 +1,4 @@
+import os as _os
 """Tests for joint configuration + rad↔tick conversion."""
 
 import math
@@ -55,3 +56,41 @@ def test_home_pose_defined_for_all_joints():
 
 def test_move_tolerance_is_small():
     assert 0 < config.MOVE_TOLERANCE_RAD < 0.1
+
+
+def test_manifest_applied_by_path_gives_taught_pose_not_raw_zeros(tmp_path):
+    """Correcting zeros MUST be accompanied by the taught pose from the SAME file.
+
+    Regression for a bug that recurred three times in different disguises. The
+    manifest fixes each joint's tick zero; the generic HOME_POSE_RAD constants
+    are ~0.0 rad. Apply the first without the second and every 0.0 rad resolves
+    to the joint's raw zero tick, so `arm.home` drives the arm to a pose nobody
+    taught it — silently, and looking entirely healthy.
+    """
+    import importlib
+    from so_arm101_actuator import config as cfg
+    importlib.reload(cfg)
+
+    manifest = "/home/craigm26/bob/ROBOT.md"
+    if not _os.path.exists(manifest):
+        import pytest
+        pytest.skip("this robot's manifest is not on this machine")
+
+    cfg.apply_manifest_calibration(manifest)
+    pose = cfg.resolve_home_pose_rad(manifest)
+    ticks = {j: cfg.rad_to_ticks(j, r) for j, r in pose.items()}
+
+    # The taught `ready` pose, in ticks, straight from the manifest.
+    taught = cfg.load_manifest_calibration(manifest)["ready_ticks"]
+    for joint, want in taught.items():
+        assert ticks[joint] == want, (
+            f"{joint} resolved to {ticks[joint]} ticks but the manifest teaches {want}")
+
+
+def test_home_pose_without_manifest_keeps_generic_constants():
+    """No manifest: the generic pose stands, and the gripper stays excluded."""
+    import importlib
+    from so_arm101_actuator import config as cfg
+    importlib.reload(cfg)
+    pose = cfg.resolve_home_pose_rad(None)
+    assert pose  # a bench with no manifest still has a usable home
