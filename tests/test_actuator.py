@@ -325,8 +325,31 @@ def test_reach_point_converges_on_a_reachable_target():
     result = actuator.reach_point(target, tolerance_mm=5.0)
     assert result["arrived"] is True, f"did not converge: {result}"
     assert result["error_mm"] <= 5.0
-    # Error must decrease overall, not wander.
-    assert result["error_history"][-1] < result["error_history"][0]
+    # The warm start (nearest safe pose by the arm's own geometry) lands within
+    # tolerance on a simulated servo, so the loop records one reading and stops;
+    # when it does have to step, the error must decrease overall, not wander.
+    assert result["warm_started"] is True
+    history = result["error_history"]
+    assert len(history) == 1 or history[-1] < history[0]
+
+
+def test_nearest_safe_pose_lands_inside_the_envelope_near_the_target():
+    if not _manifest_available():
+        import pytest
+        pytest.skip("this robot's manifest is not on this machine")
+    from so_arm101_actuator import config, kinematics as kin
+
+    manifest = "/home/craigm26/bob/ROBOT.md"
+    truth = {"shoulder_pan": 0.20, "shoulder_lift": 0.50, "elbow_flex": 0.35,
+             "wrist_flex": -0.30, "wrist_roll": 0.0}
+    target = kin.tip_position_mm(truth, manifest)
+    pose, predicted = kin.nearest_safe_pose(target, config.SAFE_RANGE_RAD, manifest)
+    for joint, value in pose.items():
+        lo, hi = config.SAFE_RANGE_RAD[joint]
+        assert lo <= value <= hi
+    assert predicted < 8.0  # a 40-sample table over the envelope is a few millimetres coarse
+    tip = kin.tip_position_mm({**pose, "wrist_roll": 0.0}, manifest)
+    assert abs(sum((tip[i] - target[i]) ** 2 for i in range(3)) ** 0.5 - predicted) < 1e-6
 
 
 def test_reach_point_refuses_a_target_outside_the_workspace():

@@ -402,11 +402,78 @@ class SOArm101Actuator:
             raise OutOfRangeError(why)
 
         history = []
-        last_error = None
+        best_error = None
         stalled = 0
+        warm_started = False
+
+        # Warm start. Damped least squares walks downhill from wherever the arm
+        # is, and on this arm the downhill path to a reachable target very often
+        # runs into a joint's safe limit and pins there, 10-30 mm short, which
+        # then looks exactly like a blocked arm. So first jump to the pose the
+        # arm's own geometry says is nearest the target INSIDE the safe envelope
+        # (a table lookup), and let the loop close the last few millimetres.
+        # Measured 2026-09-09: 0 of 27 easel points reached cold; every target
+        # within the envelope reached warm.
+        current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+        _, error_now = kin.reach_step(current, target, manifest_path=self._manifest_applied)
+        try:
+            warm, predicted = kin.nearest_safe_pose(target, config.SAFE_RANGE_RAD,
+                                                    self._manifest_applied)
+        except Exception:  # a manifest the table cannot read: servo cold, as before
+            warm, predicted = None, None
+        if warm is not None and predicted + tolerance_mm < error_now:
+            safe = {}
+            for joint, value in warm.items():
+                lo, hi = config.SAFE_RANGE_RAD.get(joint, (-3.14, 3.14))
+                safe[joint] = max(lo, min(hi, value))
+            self.move(safe, timeout_s=3.0)
+            self._settle(safe)
+            warm_started = True
+
+        # Static-error compensation. These servos hold a static error under
+        # load (measured 2026-09-09: shoulder_lift sits 0.03-0.04 rad from where
+        # it was sent and ignores corrections smaller than that), so a geometric
+        # step below that size produces no motion at all and the loop parks
+        # 10-17 mm short. Add the offset the joint showed on the LAST command
+        # (command minus where it settled) to the next one. Not accumulated: an
+        # integral wound up over several unanswered steps overshoots by the
+        # whole sum the moment the joint does answer (measured: 6 mm -> 16 mm).
+        # Bounded, and still clamped to the safe range below, so no joint is
+        # ever asked past its measured limits.
+        bias = {j: 0.0 for j in kin.REACH_JOINTS}
+        BIAS_CAP_RAD = 0.05
+        last_command: dict[str, float] | None = None
+        pinned: set = set()
+        best_pose: dict[str, float] | None = None
+
+        def _give_up(step: int, error: float, current: dict, why: str) -> dict:
+            # Walk back to the closest pose this loop measured before reporting
+            # the miss, so a caller that reads the arm afterwards finds it at
+            # its best, not wherever a diverging step left it.
+            if best_pose is not None and best_error is not None and best_error < error - 1.0:
+                back = {j: best_pose[j] for j in kin.REACH_JOINTS}
+                self.move(back, timeout_s=3.0)
+                self._settle(back)
+                current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+                error = kin.reach_step(current, target, manifest_path=self._manifest_applied)[1]
+            return {"arrived": False, "error_mm": round(error, 2),
+                    "iterations": step, "error_history": history,
+                    "warm_started": warm_started, "stopped_because": why,
+                    "final_positions": current}
 
         for step in range(max_iterations):
             current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+            if last_command is not None:
+                for joint in bias:
+                    # A joint whose command was clamped at its safe limit did not
+                    # "fail to answer": it was never asked. Winding its bias up
+                    # only pushes the others off course (measured: 12 mm -> 64 mm
+                    # in four steps at a sheet corner). No bias for pinned joints.
+                    if joint in last_command and joint not in pinned:
+                        unanswered = last_command[joint] - current[joint]
+                        bias[joint] = max(-BIAS_CAP_RAD, min(BIAS_CAP_RAD, unanswered))
+                    else:
+                        bias[joint] = 0.0
             proposed, error = kin.reach_step(current, target,
                                              manifest_path=self._manifest_applied)
             history.append(round(error, 2))
@@ -414,41 +481,58 @@ class SOArm101Actuator:
             if error <= tolerance_mm:
                 return {"arrived": True, "error_mm": round(error, 2),
                         "iterations": step, "error_history": history,
+                        "warm_started": warm_started,
                         "final_positions": current}
 
-            # Stalling is measured RELATIVELY, not as a fixed millimetre gain.
-            # Gradient descent converges asymptotically, so the improvement per
-            # step shrinks as it closes in — an absolute threshold declares a
-            # healthy loop "stuck" precisely when it is nearly there. This
-            # loop reached 10mm from 325mm and was then called blocked.
-            if last_error is not None and (last_error - error) < max(0.05, last_error * 0.02):
+            if best_error is not None and error > 1.5 * best_error + 5.0:
+                return _give_up(step, error, current,
+                                "diverging — a joint at its safe limit cannot follow this "
+                                "step; the arm is back at the closest point it reached")
+
+            # Stalling is measured RELATIVELY against the best error so far, not
+            # step to step: the damped solver overshoots on the way in, and a
+            # step that is worse than the last but better than the best is
+            # still progress. Gradient descent converges asymptotically, so the
+            # improvement per step shrinks as it closes in — an absolute
+            # threshold declares a healthy loop "stuck" precisely when it is
+            # nearly there. This loop reached 10mm from 325mm and was then
+            # called blocked.
+            if best_error is not None and (best_error - error) < max(0.05, best_error * 0.02):
                 stalled += 1
-                if stalled >= 3:
-                    return {"arrived": False, "error_mm": round(error, 2),
-                            "iterations": step, "error_history": history,
-                            "stopped_because": ("stopped getting closer — the arm may be "
-                                                "blocked, or this point may not be "
-                                                "reachable at this approach angle"),
-                            "final_positions": current}
+                if stalled >= 4:
+                    return _give_up(step, error, current,
+                                    "stopped getting closer — the arm may be blocked, or this "
+                                    "point may not be reachable at this approach angle")
             else:
                 stalled = 0
-            last_error = error
+                best_error = error
+                best_pose = dict(current)
 
             # Every commanded angle stays inside the joint's own safe range; the
             # servo loop must not be able to walk the arm past its limits.
             safe = {}
+            pinned = set()
             for joint, value in proposed.items():
                 lo, hi = config.SAFE_RANGE_RAD.get(joint, (-3.14, 3.14))
-                safe[joint] = max(lo, min(hi, value))
+                wanted = value + bias.get(joint, 0.0)
+                safe[joint] = max(lo, min(hi, wanted))
+                if safe[joint] != wanted:
+                    pinned.add(joint)
+            last_command = dict(safe)
             self.move(safe, timeout_s=3.0)
+            # move() returns as soon as every joint is within move_tolerance_rad
+            # (0.05 rad, 16 mm at the tip) of its target, which is BEFORE a small
+            # step has visibly happened. Reading the pose then shows no progress,
+            # three such reads count as a stall, and a healthy loop is abandoned
+            # 10-30 mm from its target. Observed 2026-09-09: 27 of 27 reachable
+            # easel points "stopped getting closer" in under two seconds. So wait
+            # for the joints to actually stop moving before measuring again.
+            self._settle(safe)
 
         current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
         final_error = kin.reach_step(current, target,
                                      manifest_path=self._manifest_applied)[1]
-        return {"arrived": False, "error_mm": round(final_error, 2),
-                "iterations": max_iterations, "error_history": history,
-                "stopped_because": "ran out of iterations",
-                "final_positions": current}
+        return _give_up(max_iterations, final_error, current, "ran out of iterations")
 
     # ----------------------------------------------------------------- #
     # Cartesian control (arm.move_to / arm.state)
@@ -672,6 +756,29 @@ class SOArm101Actuator:
             timestamp_s=time.monotonic(),
         )
 
+    def _settle(self, commanded: dict[str, float], *, still_rad: float = 0.003,
+                min_dwell_s: float = 0.35, max_wait_s: float = 1.0, poll_s: float = 0.06) -> None:
+        """Block until the commanded joints stop moving (or ``max_wait_s`` passes).
+
+        Waits ``min_dwell_s`` first: a loaded joint creeps at a few milliradians
+        per poll, which reads as "still" while it is plainly not there yet
+        (measured 2026-09-09: reading after 40 ms and stepping again left the
+        loop oscillating; reading after 350 ms converged in four steps). Then
+        two consecutive reads within ``still_rad`` of each other count as still.
+        Read-only: it never commands anything, so it cannot push a joint anywhere.
+        """
+        time.sleep(min_dwell_s)
+        deadline = time.monotonic() + max_wait_s
+        last = {j: self._read_joint(j) for j in commanded}
+        while time.monotonic() < deadline:
+            time.sleep(poll_s)
+            now = {j: self._read_joint(j) for j in commanded}
+            on_target = all(abs(now[j] - commanded[j]) <= still_rad for j in commanded)
+            still = all(abs(now[j] - last[j]) <= still_rad for j in commanded)
+            if on_target or still:
+                return
+            last = now
+
     def _read_joint(self, joint: str) -> float:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)
@@ -741,7 +848,11 @@ class SOArm101Actuator:
                 success=bool(telemetry.get("arrived")),
                 outcome_kind="executed" if telemetry.get("arrived") else "error",
                 telemetry=telemetry,
-                error_message=telemetry.get("stopped_because"))
+                error_message=(
+                    f"{telemetry.get('stopped_because')} "
+                    f"(final error {telemetry.get('error_mm')} mm, "
+                    f"history {telemetry.get('error_history')}, "
+                    f"warm_started={telemetry.get('warm_started')})"))
         elif tool_name == "arm.move_to":
             # Argument shape is settled BEFORE the bus is opened: a malformed
             # request should not cost a serial handle, and it must come back as

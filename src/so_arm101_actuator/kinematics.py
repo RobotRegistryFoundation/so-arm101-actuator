@@ -625,3 +625,59 @@ def solve_tool_down(target_mm: tuple[float, float, float],
             f"topology the in-house solver assumes")
 
     return IKSolution(True, "", "ok", solved)
+
+
+# --------------------------------------------------------------------------- #
+# Warm starts: the nearest pose in the safe envelope, by the arm's own geometry
+# --------------------------------------------------------------------------- #
+
+_SAFE_TABLE_CACHE: dict = {}
+
+
+def _safe_table(manifest_path: str | None, safe_ranges: dict, n: int = 40):
+    """(r, z, lift, elbow, wrist) rows over the safe envelope at pan = 0, wrist_roll = 0.
+
+    Pan is a pure rotation about the base z axis, so reachability only depends
+    on the tip's radius and height; sampling the three planar joints is enough.
+    Built once per (manifest, ranges) and kept: 64,000 forward solves, a few
+    seconds, and then every warm start is a table lookup.
+    """
+    key = (manifest_path, tuple(sorted((j, tuple(v)) for j, v in safe_ranges.items())), n)
+    rows = _SAFE_TABLE_CACHE.get(key)
+    if rows is None:
+        def span(joint, default):
+            lo, hi = safe_ranges.get(joint, default)
+            return [lo + (hi - lo) * i / (n - 1) for i in range(n)]
+        rows = []
+        for lift in span("shoulder_lift", (-3.14, 3.14)):
+            for elbow in span("elbow_flex", (-3.14, 3.14)):
+                for wrist in span("wrist_flex", (-3.14, 3.14)):
+                    x, y, z = tip_position_mm({"shoulder_pan": 0.0, "shoulder_lift": lift, "elbow_flex": elbow,
+                                               "wrist_flex": wrist, "wrist_roll": 0.0}, manifest_path)
+                    rows.append((math.hypot(x, y), z, lift, elbow, wrist))
+        _SAFE_TABLE_CACHE[key] = rows
+    return rows
+
+
+def nearest_safe_pose(target_mm: tuple[float, float, float], safe_ranges: dict,
+                      manifest_path: str | None = None) -> tuple[dict[str, float], float]:
+    """The joint pose inside the safe envelope whose tip is nearest ``target_mm``.
+
+    Returns (joints, predicted_error_mm). Used to warm-start :meth:`reach_point`
+    so the servo never has to find its way around a joint limit: a target that
+    is reachable at all is reachable from here in a handful of steps.
+    """
+    x, y, z = target_mm
+    r = math.hypot(x, y)
+    best = None
+    for row in _safe_table(manifest_path, safe_ranges):
+        d = math.hypot(row[0] - r, row[1] - z)
+        if best is None or d < best[0]:
+            best = (d, row)
+    d, (_, _, lift, elbow, wrist) = best
+    lo, hi = safe_ranges.get("shoulder_pan", (-3.14, 3.14))
+    pan = max(lo, min(hi, math.atan2(y, x)))
+    pose = {"shoulder_pan": pan, "shoulder_lift": lift, "elbow_flex": elbow, "wrist_flex": wrist}
+    tip = tip_position_mm({**pose, "wrist_roll": 0.0}, manifest_path)
+    predicted = math.sqrt(sum((tip[i] - target_mm[i]) ** 2 for i in range(3)))
+    return pose, predicted
