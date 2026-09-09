@@ -421,7 +421,11 @@ class SOArm101Actuator:
                                                     self._manifest_applied)
         except Exception:  # a manifest the table cannot read: servo cold, as before
             warm, predicted = None, None
-        if warm is not None and predicted + tolerance_mm < error_now:
+        # Only for a real jump: a short step from a settled pose converges in one
+        # to three iterations, while a warm start may swing the arm to a quite
+        # different configuration for the same tip (slow, and hard on the servos).
+        WARM_START_MIN_MM = 40.0
+        if warm is not None and error_now > WARM_START_MIN_MM and predicted + tolerance_mm < error_now:
             safe = {}
             for joint, value in warm.items():
                 lo, hi = config.SAFE_RANGE_RAD.get(joint, (-3.14, 3.14))
