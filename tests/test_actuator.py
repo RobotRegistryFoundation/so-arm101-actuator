@@ -122,7 +122,8 @@ def test_capabilities_tuple_unchanged():
     be a silent API break. Appending is how it grows."""
     actuator, _ = _make_actuator()
     assert actuator.capabilities[:3] == ("move", "home", "read_state")
-    assert actuator.capabilities == ("move", "home", "read_state", "move_to", "state")
+    assert actuator.capabilities == ("move", "home", "read_state", "move_to", "state",
+                                     "arm.estop", "arm.estop.clear")
 
 
 def test_implements_actuator_protocol():
@@ -384,3 +385,123 @@ def test_reach_point_gives_up_when_it_stops_making_progress():
     assert "stopped getting closer" in result["stopped_because"]
     # Must bail early rather than burn every iteration against an immovable arm.
     assert result["iterations"] < 10
+
+
+# --- the stop -------------------------------------------------------------
+#
+# The arm's latch was written, tested and unreachable: `estop()` existed in
+# transport.py and appeared in no capability list, no tier table and no dispatch
+# branch, so the deployed allowlist for this arm had no stop tool of any kind.
+# These tests are about REACHABILITY, not about the latch, which transport.py's
+# own tests already cover.
+
+
+def _estop_env(tool_name: str) -> dict:
+    return {"msg_id": "m-1", "tool_name": tool_name, "tool_args": {}}
+
+
+def test_arm_estop_is_reachable_through_execute_at_read_tier():
+    """The process that holds only the read bearer must be able to stop the arm."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(
+        envelope=_estop_env("arm.estop"), manifest_path="", tier="read", config={})
+    assert outcome.success is True
+    assert outcome.outcome_kind == "executed"
+    assert outcome.telemetry["estopped"] is True
+    # The honest note travels with the receipt, not only with the source file.
+    assert "NOT a hardware e-stop" in outcome.telemetry["safety_note"]
+
+
+def test_estop_holds_every_joint_at_its_measured_position():
+    """The hold commands each joint to where it already is, so a readback after
+    the stop equals the reading taken before it."""
+    seeded = {1: 1900, 2: 2100, 3: 2048, 4: 2200, 5: 1800, 6: 1539}
+    actuator, proto = _make_actuator(present_positions=seeded)
+    before = {motor: proto.read_position(motor_id=motor) for motor in seeded}
+
+    actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",
+                     tier="read", config={})
+
+    after = {motor: proto.read_position(motor_id=motor) for motor in seeded}
+    assert after == before
+
+
+def test_motion_after_an_estop_is_denied_not_executed():
+    """A stop the next command undoes is not a stop. The refusal is a DECISION
+    (`denied` -> signed 403), never a fault."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",
+                     tier="read", config={})
+
+    outcome = actuator.execute(
+        envelope={"msg_id": "m-2", "tool_name": "arm.home", "tool_args": {}},
+        manifest_path="", tier="actuate", config={})
+
+    assert outcome.success is False
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "estop_latched"
+
+
+def test_estop_clear_is_refused_below_commission_and_works_at_commission():
+    """Read tier can stop this arm. It cannot start it again."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",
+                     tier="read", config={})
+
+    refused = actuator.execute(envelope=_estop_env("arm.estop.clear"),
+                               manifest_path="", tier="read", config={})
+    assert refused.success is False
+    assert "may not invoke" in (refused.error_message or "")
+
+    # Still latched after the refusal.
+    still = actuator.execute(
+        envelope={"msg_id": "m-3", "tool_name": "arm.home", "tool_args": {}},
+        manifest_path="", tier="actuate", config={})
+    assert still.telemetry["deny"] == "estop_latched"
+
+    cleared = actuator.execute(envelope=_estop_env("arm.estop.clear"),
+                               manifest_path="", tier="commission", config={})
+    assert cleared.success is True
+    assert cleared.telemetry["estopped"] is False
+
+    moved = actuator.execute(
+        envelope={"msg_id": "m-4", "tool_name": "arm.home", "tool_args": {}},
+        manifest_path="", tier="actuate", config={})
+    assert moved.outcome_kind == "executed"
+
+
+def test_every_actuator_declares_a_read_tier_stop():
+    """No robot this gateway can MOVE may be a robot it cannot STOP.
+
+    Reads the installed entry-point registry rather than this package alone,
+    because the omission being fixed was never about one driver: a stop that
+    exists in a file and in no capability list is not a stop.
+
+    An actuator that declares no `motion_capabilities` is skipped - it moves
+    nothing, so it needs no stop. That is also this check's honest limit: an
+    actuator that declares NEITHER set is invisible here, and silence means
+    "not declared", never "verified safe".
+    """
+    import sys
+    from importlib.metadata import entry_points
+
+    checked: list[str] = []
+    offenders: list[str] = []
+    for ep in entry_points(group="robot_md_gateway.actuators"):
+        try:
+            cls = ep.load()
+        except Exception:  # noqa: BLE001 - a driver not installed here is not our business
+            continue
+        motion = frozenset(getattr(cls, "motion_capabilities", ()) or ())
+        stop = frozenset(getattr(cls, "stop_capabilities", ()) or ())
+        if not motion:
+            continue
+        checked.append(ep.name)
+        tiers = getattr(sys.modules[cls.__module__], "REQUIRED_TIERS", {})
+        if not [t for t in stop if "read" in (tiers.get(t) or frozenset())]:
+            offenders.append(ep.name)
+
+    # The driver under test must itself be one of the ones checked, or this
+    # assertion is vacuous and would pass on a machine with no actuators at all.
+    assert "so-arm101" in checked, f"so-arm101 not among registered actuators: {checked}"
+    assert offenders == [], f"actuators that move and cannot be stopped at read tier: {offenders}"

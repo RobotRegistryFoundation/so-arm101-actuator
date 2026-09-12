@@ -30,6 +30,7 @@ from tests.conftest import FIXTURE_MANIFEST
 KID = "so-arm101-test-manifest"
 BEARER = "test-actuate-token"
 READ_BEARER = "test-read-token"
+COMMISSION_BEARER = "test-commission-token"
 
 #: Bob's live policy, in the shape the operator writes it. arm.state sits with
 #: status.report; arm.move_to sits with arm.reach.
@@ -37,6 +38,10 @@ TOOL_TIERS = {
     "arm.move_to": frozenset({"actuate", "commission"}),
     "arm.state": frozenset({"read", "actuate", "commission"}),
     "status.report": frozenset({"read", "actuate", "commission"}),
+    # Anyone who can reach this arm may stop it; only the bring-up bearer may
+    # make it movable again.
+    "arm.estop": frozenset({"read", "actuate", "commission"}),
+    "arm.estop.clear": frozenset({"commission"}),
 }
 
 
@@ -76,9 +81,11 @@ def client(signed_manifest):
     app = make_app(
         resolver=_Resolver(),
         tool_allowlist=ToolAllowlist(allowed_tools=(
-            "arm.home", "arm.reach", "arm.move_to", "arm.state", "status.report")),
+            "arm.home", "arm.reach", "arm.move_to", "arm.state", "status.report",
+            "arm.estop", "arm.estop.clear")),
         tool_tier_requirements=TOOL_TIERS,
-        bearer_tiers={BEARER: "actuate", READ_BEARER: "read"},
+        bearer_tiers={BEARER: "actuate", READ_BEARER: "read",
+                      COMMISSION_BEARER: "commission"},
         actuator=SOArm101Actuator(protocol=proto),
     )
     with TestClient(app) as http:
@@ -213,3 +220,89 @@ def test_an_unauthenticated_caller_cannot_read_the_pose(client):
     )
 
     assert response.status_code in (403, 500)
+
+
+def test_arm_estop_on_the_wire_from_a_read_bearer(client):
+    """The stop, over HTTP, from the least-privileged bearer there is.
+
+    This is the shape the runtime process is in: it holds the READ bearer and
+    nothing else, and a stop it cannot reach is not a stop. Before this change
+    `arm.estop` was in no capability list, no tier table and no dispatch branch,
+    so this request came back as a signed DENY.
+    """
+    http, manifest = client
+
+    response = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.estop", {}, manifest, scope="SAFETY"),
+        headers={"Authorization": f"Bearer {READ_BEARER}"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["tool_name"] == "arm.estop"
+    assert body["outcome_kind"] == "executed"
+    assert body["telemetry"]["estopped"] is True
+    # The receipt carries the caveat, so nobody reads "e-stop" on a signed
+    # record and infers a hardware interlock this arm does not have.
+    assert "NOT a hardware e-stop" in body["telemetry"]["safety_note"]
+    assert body["attestation"] in ("attested", "unattested")
+
+
+def test_motion_after_the_estop_is_a_signed_403(client):
+    """The latch, seen from the wire: motion comes back as a signed refusal
+    carrying `estop_latched`, not as a 500 that reads like a broken robot."""
+    http, manifest = client
+
+    stop = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.estop", {}, manifest, scope="SAFETY"),
+        headers={"Authorization": f"Bearer {READ_BEARER}"},
+    )
+    assert stop.status_code == 200, stop.text
+
+    response = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.move_to", {"x_mm": 150.0, "y_mm": 0.0, "z_mm": 50.0},
+                       manifest),
+        headers={"Authorization": f"Bearer {BEARER}"},
+    )
+
+    assert response.status_code == 403
+    detail = response.json()["detail"]
+    assert detail["deny"] == "actuator_policy"
+    assert detail["telemetry"]["deny"] == "estop_latched"
+
+
+def test_clearing_the_estop_needs_the_commission_bearer(client):
+    """Read tier stops this arm and cannot start it: the clear is refused with
+    the read bearer, and the arm stays latched through the refusal."""
+    http, manifest = client
+    http.post("/v1/invoke",
+              json=_envelope("arm.estop", {}, manifest, scope="SAFETY"),
+              headers={"Authorization": f"Bearer {READ_BEARER}"})
+
+    refused = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.estop.clear", {}, manifest, scope="SAFETY"),
+        headers={"Authorization": f"Bearer {READ_BEARER}"},
+    )
+    assert refused.status_code == 403, refused.text
+
+    still_latched = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.move_to", {"x_mm": 150.0, "y_mm": 0.0, "z_mm": 50.0},
+                       manifest),
+        headers={"Authorization": f"Bearer {BEARER}"},
+    )
+    assert still_latched.status_code == 403
+    assert still_latched.json()["detail"]["telemetry"]["deny"] == "estop_latched"
+
+    cleared = http.post(
+        "/v1/invoke",
+        json=_envelope("arm.estop.clear", {}, manifest, scope="SAFETY"),
+        headers={"Authorization": f"Bearer {COMMISSION_BEARER}"},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["telemetry"]["estopped"] is False

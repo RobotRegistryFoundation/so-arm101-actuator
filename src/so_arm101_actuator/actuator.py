@@ -125,7 +125,46 @@ _BUS_LOCK = threading.Lock()
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
     "arm.home", "arm.reach", "status.report", "arm.reach_point",
     "arm.move_to", "arm.state",
+    # The stop was written and tested in transport.py long before anything could
+    # reach it: it appeared in no capability list, no tier table and no dispatch
+    # branch, so the deployed allowlist for this arm had no stop tool of any
+    # kind. Declaring it here is what makes it invocable.
+    "arm.estop", "arm.estop.clear",
 })
+
+#: The honest safety note that travels with the stop, copied verbatim from
+#: ``transport.py``'s module docstring. It is stated on the tool and returned in
+#: the telemetry the gateway signs, so nobody reads "e-stop" on a receipt and
+#: infers a hardware interlock that does not exist here.
+ESTOP_SAFETY_NOTE = (
+    "SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint to "
+    "its current encoder reading so motion stops) - NOT a hardware e-stop. The "
+    "SCS bus exposes no torque-off here, and software cannot guarantee the arm "
+    "physically stopped."
+)
+
+#: Tool descriptions for the two stop tools. Both carry the SAFETY note above,
+#: because the place a reader meets the word "e-stop" is the place the caveat
+#: has to be.
+TOOL_DESCRIPTIONS: dict[str, str] = {
+    "arm.estop": (
+        "Stop the arm and REFUSE further motion until explicitly cleared. "
+        + ESTOP_SAFETY_NOTE
+    ),
+    "arm.estop.clear": (
+        "Release the latched software e-stop so motion can be commanded again. "
+        + ESTOP_SAFETY_NOTE
+    ),
+}
+
+#: Tools that command physical motion, and tools that stop it. Declared rather
+#: than inferred from the name, so the gateway can check at startup that an
+#: allowlist carrying motion also carries a stop (``allowlist_has_no_stop``).
+MOTION_CAPABILITIES: frozenset[str] = frozenset({
+    "arm.home", "arm.reach", "arm.reach_point", "arm.move_to",
+    "move", "home", "move_to",
+})
+STOP_CAPABILITIES: frozenset[str] = frozenset({"arm.estop"})
 
 
 #: Minimum caller tiers per tool, enforced inside ``execute`` as defense in
@@ -147,6 +186,13 @@ REQUIRED_TIERS: dict[str, frozenset[str]] = {
     # Reading a pose moves nothing: same tier class as status.report.
     "arm.state": frozenset({"read", "actuate", "commission"}),
     "state": frozenset({"read", "actuate", "commission"}),
+    # Stopping is the one thing no tier may be refused. The runtime process
+    # holds only the read bearer, and a stop it cannot reach is not a stop.
+    "arm.estop": frozenset({"read", "actuate", "commission"}),
+    # Clearing the latch is the opposite act: it makes the arm movable again,
+    # so it sits behind the same bearer as bring-up motion. Read tier can stop
+    # this arm and cannot start it.
+    "arm.estop.clear": frozenset({"commission"}),
 }
 
 
@@ -214,7 +260,14 @@ class SOArm101Actuator:
     description = "SO-ARM101 6-DOF + gripper Actuator Protocol driver. RPN-000000000002."
     config_schema: dict = {}
 
-    capabilities = ("move", "home", "read_state", "move_to", "state")
+    capabilities = ("move", "home", "read_state", "move_to", "state",
+                    "arm.estop", "arm.estop.clear")
+
+    #: Read off the instance by the gateway's startup invariant. An allowlist
+    #: that carries any of `motion_capabilities` and none of `stop_capabilities`
+    #: is logged as `allowlist_has_no_stop`.
+    motion_capabilities = MOTION_CAPABILITIES
+    stop_capabilities = STOP_CAPABILITIES
 
     def __init__(
         self,
@@ -787,6 +840,24 @@ class SOArm101Actuator:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)
 
+    def _estop_transport(self, *, port: str, baud: int):
+        """The latch that owns this arm's stop, built once and kept.
+
+        The latch lives in ``SOArm101Transport`` (written, tested, and until now
+        unreachable). It is wrapped around THIS actuator instance rather than a
+        fresh one, so the two share a single ``_protocol`` and a single serial
+        handle - a second transport would mean a second open port and a latch
+        that the motion path never consults. Built lazily and cached, because
+        the latch state has to survive from the stop to the next request.
+        """
+        transport = getattr(self, "_transport", None)
+        if transport is None:
+            from so_arm101_actuator.transport import SOArm101Transport
+
+            transport = SOArm101Transport(actuator=self, port=port, baud=baud)
+            self._transport = transport
+        return transport
+
     def execute(
         self,
         *,
@@ -828,6 +899,80 @@ class SOArm101Actuator:
                     f"(requires one of {sorted(required)})"
                 ),
             )
+
+        try:
+            port = str((config or {}).get("port", "/dev/ttyACM0"))
+            baud = int((config or {}).get("baud", 1_000_000))
+        except (TypeError, ValueError) as exc:
+            return ActuatorOutcome(
+                success=False,
+                outcome_kind="error",
+                error_message=f"bad actuator config: {exc}",
+            )
+
+        # The stop, and the refusal that turns it into a stop rather than a
+        # pause. Both sit AHEAD of the capability mapping below: a latched arm
+        # must not reach the bus at all, and a stop must not depend on any of
+        # the geometry the motion tools need to be correct.
+        #
+        # SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint
+        # to its current encoder reading so motion stops) - NOT a hardware
+        # e-stop. The SCS bus exposes no torque-off here, and software cannot
+        # guarantee the arm physically stopped.
+        if tool_name == "arm.estop":
+            transport = self._estop_transport(port=port, baud=baud)
+            held: dict[str, float] = {}
+            try:
+                # Same lock every move takes: the hold writes a setpoint per
+                # joint, and a read interleaved into that sequence corrupts both.
+                with _BUS_LOCK:
+                    transport.estop()
+                    for joint in _config_module.JOINTS:
+                        try:
+                            held[joint] = self._read_joint(joint)
+                        except Exception:  # noqa: BLE001 - evidence, not control flow
+                            pass
+            except Exception as exc:  # noqa: BLE001 - the latch is already set
+                # estop() latches BEFORE it touches the bus, so a link that is
+                # down leaves this arm refusing motion rather than movable. The
+                # failure is reported; the stop still stands.
+                return ActuatorOutcome(
+                    success=False,
+                    outcome_kind="error",
+                    telemetry={"estopped": True, "safety_note": ESTOP_SAFETY_NOTE},
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+            return ActuatorOutcome(
+                success=True,
+                outcome_kind="executed",
+                telemetry={
+                    "estopped": True,
+                    "held_positions": held,
+                    "safety_note": ESTOP_SAFETY_NOTE,
+                },
+            )
+        if tool_name == "arm.estop.clear":
+            transport = self._estop_transport(port=port, baud=baud)
+            transport.clear_estop()
+            return ActuatorOutcome(
+                success=True,
+                outcome_kind="executed",
+                telemetry={
+                    "estopped": False,
+                    "safety_note": ESTOP_SAFETY_NOTE,
+                    "note": "cleared; the arm holds its pose until commanded",
+                },
+            )
+        if tool_name in MOTION_CAPABILITIES:
+            # `_estopped` is the transport's own latch - read, never copied. A
+            # second copy of this flag is a second thing that can be stale, and
+            # the one in transport.py is the one ``set_goal`` already obeys.
+            if self._estop_transport(port=port, baud=baud)._estopped:
+                return _denied(DeniedError(
+                    "estop_latched",
+                    f"arm is e-stopped; {tool_name!r} is refused until "
+                    "arm.estop.clear is invoked at the commission tier",
+                ))
 
         # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
         # stay unmapped: they need the vision rig, and the gateway deny-lists
@@ -895,8 +1040,6 @@ class SOArm101Actuator:
                 error_message=f"unknown capability: {tool_name!r}",
             )
         try:
-            port = (config or {}).get("port", "/dev/ttyACM0")
-            baud = int((config or {}).get("baud", 1_000_000))
             # Held across open AND the whole operation: a move polls the bus
             # repeatedly until it converges, and a read slipped in between
             # those polls corrupts both.
