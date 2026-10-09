@@ -139,7 +139,7 @@ def test_metadata_attributes():
     assert isinstance(actuator.config_schema, dict)
 
 
-def test_execute_dispatches_move():
+def test_execute_dispatches_move(fake_clock):
     from pathlib import Path
     actuator, proto = _make_actuator(present_positions={1: 2048})
     outcome = actuator.execute(
@@ -153,7 +153,7 @@ def test_execute_dispatches_move():
     assert outcome.telemetry["reached"] is True
 
 
-def test_execute_dispatches_home():
+def test_execute_dispatches_home(fake_clock):
     from pathlib import Path
     actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
     outcome = actuator.execute(
@@ -196,16 +196,33 @@ def test_execute_unknown_capability_returns_error_outcome():
 
 def test_execute_actuator_exception_becomes_error_outcome():
     from pathlib import Path
-    actuator, _ = _make_actuator()
+    actuator, proto = _make_actuator()
+    proto.read_position.side_effect = RuntimeError("bus jammed")
     outcome = actuator.execute(
-        envelope={"tool_name": "move", "tool_args": {"joint_positions": {"not_a_joint": 0.0}}},
+        envelope={"tool_name": "move", "tool_args": {"joint_positions": {"shoulder_pan": 0.0}}},
         manifest_path=Path("/tmp/dummy.md"),
         tier="actuate",
         config={},
     )
     assert outcome.success is False
     assert outcome.outcome_kind == "error"
-    assert "UnknownJointError" in outcome.error_message
+    assert "RuntimeError: bus jammed" in outcome.error_message
+
+
+def test_an_unknown_joint_is_a_refusal_not_a_fault():
+    """Refusing to move a joint that does not exist is a decision (a signed
+    403), not the robot breaking (a 500)."""
+    from pathlib import Path
+    actuator, proto = _make_actuator()
+    outcome = actuator.execute(
+        envelope={"tool_name": "move", "tool_args": {"joint_positions": {"not_a_joint": 0.0}}},
+        manifest_path=Path("/tmp/dummy.md"),
+        tier="actuate",
+        config={},
+    )
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "unknown_joint"
+    proto.set_position.assert_not_called()
 
 
 def test_reached_agrees_with_the_positions_in_the_same_result():
@@ -426,7 +443,7 @@ def test_estop_holds_every_joint_at_its_measured_position():
     assert after == before
 
 
-def test_motion_after_an_estop_is_denied_not_executed():
+def test_motion_after_an_estop_is_denied_not_executed(fake_clock):
     """A stop the next command undoes is not a stop. The refusal is a DECISION
     (`denied` -> signed 403), never a fault."""
     actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
@@ -442,7 +459,7 @@ def test_motion_after_an_estop_is_denied_not_executed():
     assert outcome.telemetry["deny"] == "estop_latched"
 
 
-def test_estop_clear_is_refused_below_commission_and_works_at_commission():
+def test_estop_clear_is_refused_below_commission_and_works_at_commission(fake_clock):
     """Read tier can stop this arm. It cannot start it again."""
     actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
     actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",

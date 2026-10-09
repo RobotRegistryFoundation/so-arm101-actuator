@@ -14,10 +14,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from so_arm101_actuator import config, kinematics as kin
+from so_arm101_actuator import config, kinematics as kin, motion
 from so_arm101_actuator.actuator import (
     DEFAULT_SPEED,
-    MAX_WAYPOINTS,
     SOArm101Actuator,
 )
 from so_arm101_actuator.errors import DeniedError
@@ -25,6 +24,10 @@ from tests.conftest import FIXTURE_MANIFEST
 
 M = FIXTURE_MANIFEST
 MANIFEST = Path(M)
+
+#: Every move here is a paced stream of setpoints; the fake clock makes the
+#: pacing cost no wall time.
+pytestmark = pytest.mark.usefixtures("fake_clock")
 
 #: A target the tool-down solve can actually answer on this geometry.
 TARGET = {"x_mm": 150.0, "y_mm": 0.0, "z_mm": 50.0}
@@ -132,34 +135,120 @@ def test_the_gripper_is_never_commanded_by_a_cartesian_move(monkeypatch):
 # Speed
 # --------------------------------------------------------------------------- #
 
-def test_full_speed_is_one_command_per_joint(monkeypatch):
-    """1.0 is exactly what arm.home and arm.reach have always done."""
+def _setpoints(proto) -> list[dict[int, int]]:
+    """The commanded poses, one per setpoint, rebuilt from the bus writes."""
+    poses: list[dict[int, int]] = []
+    current: dict[int, int] = {}
+    for call in proto.set_position.call_args_list:
+        motor, ticks = call.kwargs["motor_id"], call.kwargs["ticks"]
+        if motor in current:
+            poses.append(dict(current))
+            current = {}
+        current[motor] = ticks
+    if current:
+        poses.append(current)
+    return poses
+
+
+def _tool_speeds_mps(proto, step_s: float, window: int = 1) -> list[float]:
+    """Tip speed over ``window`` consecutive setpoints, by forward kinematics.
+
+    Setpoints are whole encoder ticks, so one step can be up to a tick per joint
+    off the planned line (a few tenths of a millimetre at the tip); a window of
+    a few steps averages that out, as the EV-03 scorer's 0.2 s window does."""
+    chain = kin.Chain(M)
+    names = {spec["motor_id"]: joint for joint, spec in config.JOINTS.items()}
+    tips = []
+    pose: dict[str, float] = {}
+    for setpoint in _setpoints(proto):
+        pose.update({names[m]: config.ticks_to_rad(names[m], t) for m, t in setpoint.items()})
+        tips.append(chain.points(pose)["tip"])
+    return [math.dist(tips[i], tips[i - window]) / 1000.0 / (window * step_s)
+            for i in range(window, len(tips))]
+
+
+def test_full_speed_is_paced_under_the_declared_tool_limit(monkeypatch):
+    """1.0 used to be one direct command per joint: the servos' own top speed.
+    It is now the declared limit (0.25 m/s at the tool when, as here, the
+    manifest declares none), as a stream of small setpoints."""
     monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
     actuator, proto = _actuator()
     telemetry = _invoke(actuator, "arm.move_to", {**TARGET, "speed": 1.0}).telemetry
 
-    assert telemetry["waypoints"] == 1
-    assert proto.set_position.call_count == 5  # one per moved joint, once
-
-
-def test_a_slower_speed_paces_the_motion_through_waypoints(monkeypatch):
-    """The bus takes Goal_Position and nothing else, so "slower" is spelled as
-    more, smaller commands along the same straight line."""
-    monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
-    actuator, proto = _actuator()
-    telemetry = _invoke(actuator, "arm.move_to", {**TARGET, "speed": 0.25}).telemetry
-
-    assert telemetry["waypoints"] == 4
-    assert proto.set_position.call_count == 5 * 4
-    # It still arrives: pacing changes the path, not the destination.
+    paced = telemetry["motion"]
+    assert telemetry["waypoints"] == paced["setpoints"] > 10
+    assert paced["tool_speed_limit_mps"] == kin.DEFAULT_MAX_TOOL_SPEED_MPS
+    assert paced["pace_period_s"] <= motion.PACE_PERIOD_S
+    # Planned at 80 % of the limit; no single step reaches the limit itself,
+    # and over 0.1 s the stream holds the plan.
+    assert max(_tool_speeds_mps(proto, paced["pace_period_s"])) < kin.DEFAULT_MAX_TOOL_SPEED_MPS
+    assert max(_tool_speeds_mps(proto, paced["pace_period_s"], window=5)) <= (
+        kin.DEFAULT_MAX_TOOL_SPEED_MPS * motion.PACE_FRACTION * 1.03)
     assert telemetry["error_mm"] < 1.0
 
 
-def test_waypoints_are_capped_so_a_tiny_speed_is_not_a_hang(monkeypatch):
+def test_a_slower_speed_takes_proportionally_longer(monkeypatch):
+    """The bus takes Goal_Position and nothing else, so "slower" is spelled as
+    more, smaller commands along the same straight line."""
     monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
-    actuator, _ = _actuator()
-    telemetry = _invoke(actuator, "arm.move_to", {**TARGET, "speed": 0.001}).telemetry
-    assert telemetry["waypoints"] == MAX_WAYPOINTS
+    fast, _ = _actuator()
+    full = _invoke(fast, "arm.move_to", {**TARGET, "speed": 1.0}).telemetry["motion"]
+    slow, proto = _actuator()
+    quarter = _invoke(slow, "arm.move_to", {**TARGET, "speed": 0.25}).telemetry
+
+    assert quarter["motion"]["planned_duration_s"] == pytest.approx(
+        4 * full["planned_duration_s"], rel=0.01)
+    assert quarter["motion"]["setpoints"] > 3 * full["setpoints"]
+    speeds = _tool_speeds_mps(proto, quarter["motion"]["pace_period_s"], window=25)
+    assert max(speeds) <= 0.25 * kin.DEFAULT_MAX_TOOL_SPEED_MPS * motion.PACE_FRACTION * 1.05
+    # It still arrives: pacing changes the timing, not the destination.
+    assert quarter["error_mm"] < 1.0
+
+
+def test_a_manifest_tool_limit_and_joint_limit_both_bound_the_stream(monkeypatch, tmp_path):
+    """`safety.max_linear_velocity_ms` replaces the default tool limit, and
+    `safety.max_joint_velocity_dps` caps every joint as well."""
+    monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
+    text = Path(M).read_text()
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(text.replace("\n---", "\nsafety:\n  max_linear_velocity_ms: 0.5\n"
+                                              "  max_joint_velocity_dps: 30\n---", 1))
+    proto = MagicMock()
+    state: dict[int, int] = {i: 2048 for i in range(1, 7)}
+    proto.set_position.side_effect = lambda motor_id, ticks: state.__setitem__(motor_id, ticks)
+    proto.read_position.side_effect = lambda motor_id: state.get(motor_id, 2048)
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.move_to", "tool_args": TARGET},
+                               manifest_path=manifest, tier="actuate", config={})
+
+    paced = outcome.telemetry["motion"]
+    assert paced["tool_speed_limit_mps"] == 0.5
+    assert paced["joint_speed_limit_dps"] == 30
+    step = paced["pace_period_s"]
+    names = {spec["motor_id"]: joint for joint, spec in config.JOINTS.items()}
+    last = None
+    for setpoint in _setpoints(proto):
+        if last is not None:
+            for motor, ticks in setpoint.items():
+                joint = names[motor]
+                dps = abs(math.degrees(config.ticks_to_rad(joint, ticks)
+                                       - config.ticks_to_rad(joint, last.get(motor, ticks)))) / step
+                one_tick = 360.0 / 4096 / step  # setpoints are whole ticks
+                assert dps <= 30 * motion.PACE_FRACTION * 1.01 + one_tick
+        last = setpoint
+
+
+@pytest.mark.parametrize("speed", [0.001, 5e-324, 1e-309])
+def test_a_speed_too_small_to_finish_is_refused_not_a_hang(monkeypatch, speed):
+    """A tiny speed is a real request for a slow move, and it would hold the bus
+    for minutes. A subnormal one used to raise OverflowError, a 500."""
+    monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
+    actuator, proto = _actuator()
+    outcome = _invoke(actuator, "arm.move_to", {**TARGET, "speed": speed})
+
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] in ("too_slow", "bad_args")
+    proto.set_position.assert_not_called()
 
 
 def test_the_default_speed_is_recorded_in_the_receipt(monkeypatch):
@@ -169,7 +258,8 @@ def test_the_default_speed_is_recorded_in_the_receipt(monkeypatch):
     assert telemetry["speed"] == DEFAULT_SPEED
 
 
-@pytest.mark.parametrize("speed", [0, 0.0, -0.5, 1.5, "fast", None, True])
+@pytest.mark.parametrize("speed", [0, 0.0, -0.5, 1.5, "fast", None, True,
+                                   float("nan"), float("inf"), float("-inf")])
 def test_a_speed_outside_the_scale_is_refused_not_clamped(speed):
     actuator, proto = _actuator()
     outcome = _invoke(actuator, "arm.move_to", {**TARGET, "speed": speed})

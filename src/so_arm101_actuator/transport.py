@@ -144,8 +144,15 @@ class SOArm101Transport(Transport):
 
     def estop(self) -> None:
         """Best-effort SOFTWARE hold (NOT a hardware e-stop — see module note).
-        Commands each joint to its current encoder reading so motion stops, then
+        Holds each joint (``SOArm101Actuator._hold_pose``) so motion stops, and
         latches the e-stop flag (cleared via ``clear_estop``).
+
+        What is held is chosen once per latch: the goal a joint was last sent
+        when it is holding that goal, otherwise where it reads. A repeated stop
+        re-sends the same goals. It used to re-read the encoders every time, and
+        under gravity each reading is the sagged pose, so every repeat lowered
+        the goal by the sag: 9 cm in 8 s of stops 0.2 s apart (EV-03,
+        simulation, October 2026).
 
         FAIL-SAFE: the flag is latched FIRST, before the bus hold is attempted —
         so if the link is down (``open`` raises) or the hold cannot be sent, the
@@ -154,19 +161,18 @@ class SOArm101Transport(Transport):
         couldn't confirm. We fail toward stopped, never toward movable."""
         self._estopped = True
         self.open()
-        proto = self._actuator._protocol
         try:
-            for spec in config.JOINTS.values():
-                ticks = proto.read_position(motor_id=spec["motor_id"])
-                proto.set_position(motor_id=spec["motor_id"], ticks=ticks)
+            self._actuator._hold_pose()
         except (IOError, OSError) as exc:
             raise TransportError(
                 TransportErrorCode.IO_ERROR, f"e-stop could not command hold: {exc}"
             ) from exc
 
     def clear_estop(self) -> None:
-        """Release the latched software e-stop so motion can be commanded again."""
+        """Release the latched software e-stop so motion can be commanded again.
+        The arm keeps holding its pose; the next stop chooses its hold afresh."""
         self._estopped = False
+        self._actuator._held = None
 
 
 def make_hal_actuator(config_dict: dict | None = None):

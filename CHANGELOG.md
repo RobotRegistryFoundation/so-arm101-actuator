@@ -6,6 +6,59 @@ All notable changes to `so-arm101-actuator`. Format loosely follows
 Entries before 0.3.0 are reconstructed from the git history — this file did not
 exist while they shipped.
 
+## [Unreleased]
+
+What EV-03 found when it ran this driver behind robot-md-gateway against a
+simulated servo bus with bob's calibration and gravity sag (October 2026), and
+the fixes. Configured to do real work, the tip went up to 13 mm below the
+declared floor: targets on the floor face were accepted, the sagging arm rested
+below them, and full-slew jumps overshot on the way. The driver's own receipts
+put the tip outside the workspace after 270 to 450 moves per ten-minute run, and
+nothing bounded speed.
+
+### Changed (behaviour)
+
+- **Every gateway motion is a checked, paced line** (`motion.py`). `arm.move_to`,
+  `arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move` go from the
+  pose the arm is held at to the goal along one joint-space line that is
+  checked against `physics.workspace.bounds_mm` at the elbow, wrist and tip,
+  as commanded and as the arm will really be (commanded + its current offset),
+  with a margin (`SO_ARM101_WORKSPACE_MARGIN_MM`, default 10 mm), and streamed
+  as setpoints at most 20 ms apart under the declared speed limits. New deny
+  codes: `path_leaves_workspace`, `too_slow`. **No target closer than the margin
+  to a face is accepted.**
+- **`speed` means the fraction of the declared limits.** 1.0 (the default) used
+  to be one direct Goal_Position command, which ran the servos at their own top
+  speed; it is now the manifest's limits: `safety.max_linear_velocity_ms` for
+  the tool point (0.25 m/s when undeclared) and `safety.max_joint_velocity_dps`
+  per joint. Moves take longer. The `waypoints` telemetry key is now the number
+  of setpoints streamed; a `motion` block reports the pacing, the limits, how
+  close the path came to a face and whether a stop ended it.
+- **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
+  waits for the bus lock, a paced move checks the latch before every setpoint,
+  and the hold re-sends the goals it chose for this latch instead of re-reading
+  the sagged encoders on every repeat (which walked the arm down 9 cm in 8 s in
+  simulation). It holds the goal a joint is holding, not its sag.
+- **`arm.reach_point`** refuses targets less than the margin inside the
+  workspace (`out_of_workspace`; it checked reach only and steered to
+  z = -101.7 mm), takes only checked, paced steps, runs under the bus lock and
+  opens the port itself (its first call on a fresh gateway was an HTTP 500).
+- **The servo bus is opened exclusively** (pyserial `exclusive=True` plus
+  `TIOCEXCL`), so another process's `open(2)` fails with `EBUSY` while the
+  driver holds it. New `claim(config)` and `close()`; robot-md-gateway calls
+  `claim()` at startup. A dropped handle is now released, not leaked.
+- A subnormal `speed` (5e-324) is refused as `too_slow` instead of raising
+  `OverflowError` (an HTTP 500).
+- An unknown joint or a joint value outside its limits is a signed refusal
+  (`unknown_joint`, `joint_limits`), not a 500. A bare `move` takes only
+  `joint_positions`, `speed` and `timeout_s`.
+
+### Added
+
+- `kinematics.Chain` (fast forward kinematics for the elbow, wrist and tip),
+  `kinematics.Box` / `workspace_box`, `kinematics.declared_speed_limits`.
+- `protocol.SCSProtocol.read_goal_position`.
+
 ## [0.3.0]
 
 ### Added

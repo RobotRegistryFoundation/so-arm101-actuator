@@ -189,6 +189,144 @@ def tip_position_mm(joint_rad: dict[str, float],
             round(position[2] + moved[2], 2))
 
 
+class Chain:
+    """The manifest's chain, read once, for forward kinematics inside a loop.
+
+    :func:`tip_position_mm` re-reads the manifest and rounds to 0.01 mm, which
+    is right for a receipt and wrong for a path check that evaluates hundreds of
+    poses and can be argued with at exactly the boundary it is checking. Same
+    walk, same convention: each joint rotates about its declared axis, then
+    translates ``a_mm`` along x and ``d_mm`` along z; the gripper is skipped.
+    """
+
+    def __init__(self, manifest_path: str | None = None) -> None:
+        chain = _read_chain(manifest_path)
+        if not chain:
+            raise ValueError("manifest declares no kinematic chain")
+        self.links = [
+            (str(j.get("id")), str(j.get("axis", "z")).lower(),
+             float(j.get("a_mm", 0.0)), float(j.get("d_mm", 0.0)))
+            for j in chain if str(j.get("id")) != "gripper"
+        ]
+        self.tip = tip_offset_from_manifest(manifest_path)
+
+    def points(self, joint_rad: dict[str, float]) -> dict[str, tuple[float, float, float]]:
+        """The elbow, the wrist and the tip, in the base frame, in millimetres.
+
+        ``elbow`` is where the elbow_flex joint sits (the end of the upper arm),
+        ``wrist`` is where the wrist_flex joint sits (the end of the forearm).
+        A link is more than its far end, so three points are not the whole arm;
+        they are the places other than the tip that a box around a tabletop arm
+        meets first.
+        """
+        r00, r01, r02, r10, r11, r12, r20, r21, r22 = 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0
+        px = py = pz = 0.0
+        out: dict[str, tuple[float, float, float]] = {}
+        for name, axis, a, d in self.links:
+            angle = joint_rad.get(name, 0.0)
+            c, s = math.cos(angle), math.sin(angle)
+            # rotation = rotation @ R_axis(angle)
+            if axis == "x":
+                r01, r02 = r01 * c + r02 * s, -r01 * s + r02 * c
+                r11, r12 = r11 * c + r12 * s, -r11 * s + r12 * c
+                r21, r22 = r21 * c + r22 * s, -r21 * s + r22 * c
+            elif axis == "y":
+                r00, r02 = r00 * c - r02 * s, r00 * s + r02 * c
+                r10, r12 = r10 * c - r12 * s, r10 * s + r12 * c
+                r20, r22 = r20 * c - r22 * s, r20 * s + r22 * c
+            else:
+                r00, r01 = r00 * c + r01 * s, -r00 * s + r01 * c
+                r10, r11 = r10 * c + r11 * s, -r10 * s + r11 * c
+                r20, r21 = r20 * c + r21 * s, -r20 * s + r21 * c
+            px += r00 * a + r02 * d
+            py += r10 * a + r12 * d
+            pz += r20 * a + r22 * d
+            if name == "shoulder_lift":
+                out["elbow"] = (px, py, pz)
+            elif name == "elbow_flex":
+                out["wrist"] = (px, py, pz)
+        tx, ty, tz = self.tip
+        out["tip"] = (px + r00 * tx + r01 * ty + r02 * tz,
+                      py + r10 * tx + r11 * ty + r12 * tz,
+                      pz + r20 * tx + r21 * ty + r22 * tz)
+        return out
+
+
+@dataclass(frozen=True)
+class Box:
+    """`physics.workspace.bounds_mm` as two corners. An axis the manifest leaves
+    out is unbounded on that axis, exactly as :func:`within_workspace` treats it."""
+
+    low: tuple[float, float, float]
+    high: tuple[float, float, float]
+
+    def clearance(self, point: tuple[float, float, float]) -> float:
+        """How far inside the box the point is, in mm: the distance to the
+        nearest face, negative when the point is outside it. +inf when no face
+        is declared."""
+        best = math.inf
+        for value, low, high in zip(point, self.low, self.high, strict=True):
+            best = min(best, value - low, high - value)
+        return best
+
+    def nearest_face(self, point: tuple[float, float, float]) -> str:
+        """The face :meth:`clearance` measured to, as ``"z>=0"`` or ``"x<=340"``."""
+        best, name = math.inf, "none"
+        for axis, value, low, high in zip("xyz", point, self.low, self.high, strict=True):
+            if value - low < best:
+                best, name = value - low, f"{axis}>={low:g}"
+            if high - value < best:
+                best, name = high - value, f"{axis}<={high:g}"
+        return name
+
+
+def workspace_box(manifest_path: str | None = None) -> Box | None:
+    """The declared workspace, or None when the manifest declares none."""
+    bounds = (((frontmatter(manifest_path).get("physics") or {}).get("workspace") or {})
+              .get("bounds_mm") or {})
+    if not bounds:
+        return None
+    low, high = [-math.inf] * 3, [math.inf] * 3
+    for i, axis in enumerate("xyz"):
+        span = bounds.get(axis)
+        if span and len(span) == 2:
+            low[i], high[i] = float(span[0]), float(span[1])
+    return Box(tuple(low), tuple(high))
+
+
+#: Tool-point speed limit when the manifest declares none: ISO 10218-1's
+#: "reduced speed" for a robot working near people, 250 mm/s. Conservative for a
+#: desk arm on purpose; a manifest that wants faster says so explicitly.
+DEFAULT_MAX_TOOL_SPEED_MPS = 0.25
+
+
+def declared_speed_limits(manifest_path: str | None = None) -> dict:
+    """The speed limits this robot's manifest declares, with where each came from.
+
+    ``safety.max_linear_velocity_ms`` (the schema's linear speed limit, m/s) is
+    read as the TOOL POINT's speed limit on this arm; absent, it is
+    :data:`DEFAULT_MAX_TOOL_SPEED_MPS`. ``safety.max_joint_velocity_dps`` is the
+    per-joint limit; absent, no joint limit applies beyond the tool's. A value
+    that is not a positive finite number is treated as absent rather than as
+    permission: a typo must not mean "unlimited".
+    """
+    safety = frontmatter(manifest_path).get("safety") or {}
+
+    def _positive(value) -> float | None:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        value = float(value)
+        return value if math.isfinite(value) and value > 0 else None
+
+    tool = _positive(safety.get("max_linear_velocity_ms"))
+    joint = _positive(safety.get("max_joint_velocity_dps"))
+    return {
+        "tool_mps": tool if tool is not None else DEFAULT_MAX_TOOL_SPEED_MPS,
+        "tool_source": "manifest" if tool is not None else "default",
+        "joint_dps": joint,
+    }
+
+
 def max_reach_mm(manifest_path: str | None = None) -> float:
     """Farthest the tip can get from the base — the sum of the link lengths."""
     chain = _read_chain(manifest_path)

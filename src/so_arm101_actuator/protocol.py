@@ -101,6 +101,23 @@ class SCSProtocol:
         lo, hi = resp[5], resp[6]
         return lo | (hi << 8)
 
+    def read_goal_position(self, motor_id: int) -> int:
+        """Read Goal_Position (2 bytes) from `motor_id`: the setpoint the servo
+        is holding, which under gravity is not where it IS. Returns ticks."""
+        params = bytes([SCS_REG_GOAL_POSITION, 0x02])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_READ_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        resp = self._serial.read(8)
+        if len(resp) < 8 or resp[:2] != b"\xff\xff":
+            from so_arm101_actuator.errors import ProtocolError
+            raise ProtocolError(f"bad header: {resp!r}")
+        lo, hi = resp[5], resp[6]
+        return lo | (hi << 8)
+
     def read_temperature(self, motor_id: int) -> int:
         """Read Present_Temperature (1 byte) from `motor_id`. Returns temperature in Celsius."""
         params = bytes([SCS_REG_PRESENT_TEMPERATURE, 0x01])
