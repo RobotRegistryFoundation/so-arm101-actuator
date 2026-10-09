@@ -326,7 +326,11 @@ for the bus, every other request is refused as `busy` at once (one that gets the
 bus first hands it straight back), and otherwise a request waits at most 1 s for
 the bus and is then refused: commands are not queued behind a running move.
 (robot-md-gateway runs stop tools on worker threads of their own, so a burst of
-other requests cannot hold the stop back before it gets here either.)
+other requests no longer holds the stop back waiting for a thread before it gets
+here. A flood that saturates the gateway's CPU still delays it: in simulation,
+with clients in other processes on two cores, the stop latched 0.9 s after it
+was sent under 120 looping clients and 4.7 s under 200, and with no other
+traffic in 0.05 s.)
 
 The hold picks each joint's goal once per latch: the goal its servo is holding
 (read back from the servo's Goal_Position register), when the joint reads within
