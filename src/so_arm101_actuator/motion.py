@@ -396,3 +396,25 @@ def check_line(current: dict[str, float], target: dict[str, float], *, chain: Ch
     return PathCheck(ok=True, detail="the whole path stays inside the declared workspace",
                      min_clearance_mm=round(worst + margin, 2), worst_point_mm=worst_tip,
                      start_clearance_mm=round(start + margin, 2))
+
+
+# --------------------------------------------------------------------------- #
+# Gravity
+# --------------------------------------------------------------------------- #
+
+#: Joints whose load changes with the arm's pose under gravity.
+GRAVITY_JOINTS = ("shoulder_lift", "elbow_flex", "wrist_flex")
+
+#: A drop rate below this (mm of tip height per radian) says too little about
+#: a joint's load to learn its sag from.
+MIN_DROP_RATE_MM = 20.0
+
+
+def drop_rate_mm(chain: Chain, q: dict[str, float]) -> dict[str, float]:
+    """How fast the tip drops when each gravity-loaded joint turns, -dz/dq in
+    mm/rad. With the arm's weight lumped at the tip (virtual work), a joint's
+    gravity torque, and so how far it sags from its goal, goes with this."""
+    z0 = chain.tip_mm(q)[2]
+    h = 1e-3
+    return {j: -(chain.tip_mm({**q, j: q[j] + h})[2] - z0) / h
+            for j in GRAVITY_JOINTS if j in q}

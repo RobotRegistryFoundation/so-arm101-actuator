@@ -33,6 +33,17 @@ the harness are in the EV-03 test kit.
   `SO_ARM101_WORKSPACE_MARGIN_MM` keeps the commanded path that far inside every face
   (default 0); the check is on the commanded path, and a loaded servo settles short of
   its goal.
+- **Loaded joints are held on target.** A position servo settles short of its goal under
+  load (bob: shoulder_lift 27 ticks, elbow_flex 19, wrist_flex 12, lifted into place), so
+  a path checked as commanded can still leave the arm below the floor. Once a paced move
+  comes to rest, each joint's goal is offset by the error it settled with: bounded
+  (0.05 rad), clamped to the safe range, paced, a few rounds, each joint keeping its best
+  offset; a joint that stops improving is not pushed harder. The sag this shows (goal
+  offset per mm/rad of the tip's drop rate) is fed forward into later moves, so the arm
+  does not ride below its path while moving either. In the EV-03 simulation of bob's
+  sag the tip's error after a move fell from 11–13 mm to under 1 mm, and the worst
+  excursion below the declared floor from 13.6 mm to 4.6 mm (mid-move, onto targets on
+  the floor plane itself). reach_point keeps its own correction.
 - **`arm.reach_point` checks the declared workspace** (it checked reach only, and walked
   to z = −101.7 mm), runs under the bus lock, and opens the port itself (its first call
   on a fresh gateway was an HTTP 500, AttributeError).
@@ -71,6 +82,9 @@ the harness are in the EV-03 test kit.
   `JOINT_POSITIONS` goal still calls it.
 - The first stop on a loaded arm still lets each joint settle by its static error once
   (one sag step, a few mm at the tip in simulation). Check it on the arm.
+- The sag model is learned online and is a model: on a different arm, payload or pose
+  range it can be wrong, which is what the bound and the per-joint best are for. It
+  needs checking on the arm.
 
 ## [0.3.0]
 

@@ -31,6 +31,13 @@ from so_arm101_actuator.errors import (
 #: simulation, against 180 declared); every move is now paced. See motion.py.
 DEFAULT_SPEED = 1.0
 
+#: Static-error correction after a paced move (see _correct_static_error):
+#: rounds at most, the error below which a joint counts as on target (two
+#: encoder ticks), and the most a goal may be offset from its target.
+STATIC_CORRECTION_ROUNDS = 4
+STATIC_CORRECTION_DEADBAND_RAD = 2 * (2 * math.pi / 4096)
+STATIC_CORRECTION_CAP_RAD = 0.05
+
 #: Envelope scopes that may carry a motion tool. A motion tool named in an
 #: envelope whose scope says OBSERVE is refused: the signer said "observe",
 #: and the scope is part of what was signed.
@@ -369,6 +376,12 @@ class SOArm101Actuator:
         #: motion loop checks this between bus writes and abandons the move.
         self._stop_requested = threading.Event()
 
+        #: Learned per joint: goal offset (rad) per mm/rad of the tip's drop
+        #: rate, from the static corrections so far. Empty until the arm has
+        #: settled somewhere; see _learn_sag.
+        self._sag_gain: dict[str, float] = {}
+        self._last_offsets: dict[str, float] = {}
+
     @classmethod
     def from_default_port(cls, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> "SOArm101Actuator":
         import serial
@@ -404,7 +417,9 @@ class SOArm101Actuator:
         while True:
             self._check_stop()
             remaining = end - time.monotonic()
-            if remaining <= 0:
+            # Under a microsecond counts as done: a clock that ticks in whole
+            # microseconds (the EV-03 simulator's) would otherwise never get there.
+            if remaining < 1e-6:
                 return
             time.sleep(min(remaining, motion.CONTROL_PERIOD_S))
 
@@ -498,11 +513,13 @@ class SOArm101Actuator:
 
     def _move_paced(self, target: dict[str, float], *, speed: float = DEFAULT_SPEED,
                     timeout_s: float = 5.0, current: dict[str, float] | None = None,
+                    correct: bool = True,
                     ) -> tuple[MoveResult, motion.Plan, motion.PathCheck | None]:
         """Check the whole path, then walk it one control period at a time.
 
         ``current`` lets a caller that has just read the joints (``move_to``)
-        hand them over instead of reading them twice.
+        hand them over instead of reading them twice. ``correct=False`` skips
+        the static-error correction, for reach_point, which has its own.
         """
         self._validate_joints(target)
         speed = motion.validate_speed(speed)
@@ -533,22 +550,172 @@ class SOArm101Actuator:
         start_pose = {j: now[j] for j in target}
         plan = motion.plan_line(start_pose, target, speed=speed,
                                 limits=motion.motion_limits(manifest), lever=lever)
+
+        # Gravity feed-forward. A loaded joint settles short of its goal by an
+        # amount that goes with its gravity load, and the correction below only
+        # fixes that once the arm is at rest: during the move itself the arm
+        # rode up to 9 mm below a path that only touched the declared floor
+        # (EV-03, simulated). So each commanded step is offset by the sag the
+        # arm has shown so far, scaled to the step's own load (see _learn_sag).
+        # No gain learned yet: no offset, as before.
+        feed = correct and chain is not None and bool(self._sag_gain)
+
+        def offset_at(pose: dict[str, float]) -> dict[str, float]:
+            if not feed:
+                return {}
+            return self._sag_offsets(chain, {**now, **pose})
+
         started = time.monotonic()
-        for index, step in enumerate(plan.steps[:-1], start=1):
+        steps = plan.steps if correct else plan.steps[:-1]
+        for index, step in enumerate(steps, start=1):
             self._check_stop()
+            ff = offset_at(step)
             for joint, rad in step.items():
+                goal = self._clamp_goal(joint, rad + ff.get(joint, 0.0))
                 self._protocol.set_position(motor_id=config.JOINTS[joint]["motor_id"],
-                                            ticks=config.rad_to_ticks(joint, rad))
+                                            ticks=config.rad_to_ticks(joint, goal))
             # Sleep to the end of this step's slot, not for a fixed period, so
             # the bus time does not add up into a slower move than planned (and
             # never into a faster one).
             remaining = started + index * plan.period_s - time.monotonic()
             if remaining > 0:
                 time.sleep(remaining)
-        # The last step is the target itself: move() writes it and waits for the
-        # joints to arrive, which is the receipt every caller already reads.
-        result = self.move(target, timeout_s=timeout_s)
+        if not correct:
+            # The last step is the target itself: move() writes it and waits for
+            # the joints to arrive, which is the receipt every caller reads.
+            return self.move(target, timeout_s=timeout_s), plan, check
+        result = self._correct_static_error(
+            target, MoveResult(reached=False, final_positions=dict(target),
+                               elapsed_s=0.0, max_error_rad=0.0),
+            start_offsets=offset_at(target))
+        result = MoveResult(reached=result["reached"], final_positions=result["final_positions"],
+                            elapsed_s=time.monotonic() - started,
+                            max_error_rad=result["max_error_rad"])
+        if chain is not None:
+            self._learn_sag(chain, {**now, **target})
         return result, plan, check
+
+    def _clamp_goal(self, joint: str, rad: float) -> float:
+        spec = config.JOINTS[joint]
+        lo, hi = config.resolve_safe_range_rad().get(joint, (spec["min_rad"], spec["max_rad"]))
+        return max(max(lo, spec["min_rad"]), min(min(hi, spec["max_rad"]), rad))
+
+    def _sag_offsets(self, chain: motion.Chain, q: dict[str, float]) -> dict[str, float]:
+        """Goal offsets that cancel the sag predicted at pose ``q``."""
+        rates = motion.drop_rate_mm(chain, q)
+        return {j: max(-STATIC_CORRECTION_CAP_RAD,
+                       min(STATIC_CORRECTION_CAP_RAD, self._sag_gain[j] * rates[j]))
+                for j in rates if j in self._sag_gain}
+
+    def _learn_sag(self, chain: motion.Chain, q: dict[str, float]) -> None:
+        """Refine each loaded joint's sag gain (goal offset per mm/rad of drop
+        rate) from the offset the correction just settled on at pose ``q``.
+
+        Only from poses where the joint carries enough load to say something,
+        smoothed over moves so one friction-skewed reading cannot swing it, and
+        bounded by STATIC_CORRECTION_CAP_RAD wherever it is applied."""
+        rates = motion.drop_rate_mm(chain, q)
+        for joint, rate in rates.items():
+            if abs(rate) < motion.MIN_DROP_RATE_MM or joint not in self._last_offsets:
+                continue
+            seen = self._last_offsets[joint] / rate
+            old = self._sag_gain.get(joint)
+            self._sag_gain[joint] = seen if old is None else 0.5 * old + 0.5 * seen
+
+    def _correct_static_error(self, target: dict[str, float], result: MoveResult, *,
+                              start_offsets: dict[str, float] | None = None) -> MoveResult:
+        """Hold the joints on the target, not short of it.
+
+        A position servo is a spring around its goal with gearbox friction, so a
+        loaded joint settles short of the goal it was sent (bob, 8 Oct 2026:
+        shoulder_lift 27 ticks, elbow_flex 19, wrist_flex 12, lifted into place).
+        The path check is on the commanded path; in the EV-03 simulation of that
+        fit, the tip then sat up to 13.6 mm below the declared floor for seconds
+        at a time, and the driver's own receipts said so.
+
+        So, once the joints have come to rest, offset each one's goal by the
+        error it settled with, as reach_point has since 2026-09-09: bounded per
+        joint (STATIC_CORRECTION_CAP_RAD), clamped to the safe range, paced like
+        any move, a few rounds at most. Each joint keeps the offset that left it
+        closest to its target; a joint that stops improving is left at its best
+        offset, so an arm held by something it cannot move is not pushed harder
+        into it (that is how a servo is cooked).
+        """
+        self._settle(target)
+        result = self._snapshot(target, result)
+        safe = config.resolve_safe_range_rad()
+
+        def errors(r: MoveResult) -> dict[str, float]:
+            return {j: target[j] - r["final_positions"][j] for j in target}
+
+        def goal_for(offsets: dict[str, float]) -> dict[str, float]:
+            out = {}
+            for joint, offset in offsets.items():
+                spec = config.JOINTS[joint]
+                lo, hi = safe.get(joint, (spec["min_rad"], spec["max_rad"]))
+                lo, hi = max(lo, spec["min_rad"]), min(hi, spec["max_rad"])
+                out[joint] = max(lo, min(hi, target[joint] + offset))
+            return out
+
+        errs = errors(result)
+        offsets = {joint: (start_offsets or {}).get(joint, 0.0) for joint in target}
+        best_offsets = dict(offsets)
+        best = {joint: abs(e) for joint, e in errs.items()}
+        settled = set()
+        goal = goal_for(offsets)
+        for _ in range(STATIC_CORRECTION_ROUNDS):
+            active = [j for j in target
+                      if j not in settled and abs(errs[j]) > STATIC_CORRECTION_DEADBAND_RAD]
+            if not active:
+                break
+            for joint in active:
+                offsets[joint] = max(-STATIC_CORRECTION_CAP_RAD,
+                                     min(STATIC_CORRECTION_CAP_RAD, offsets[joint] + errs[joint]))
+            nxt = goal_for(offsets)
+            if nxt == goal:
+                break
+            self._step_to(goal, nxt)
+            goal = nxt
+            self._settle(goal)
+            result = self._snapshot(target, result)
+            errs = errors(result)
+            for joint in active:
+                if abs(errs[joint]) < best[joint]:
+                    best[joint], best_offsets[joint] = abs(errs[joint]), offsets[joint]
+                else:
+                    settled.add(joint)            # stopped improving: keep its best
+                    offsets[joint] = best_offsets[joint]
+        final = goal_for(best_offsets)
+        if final != goal:
+            self._step_to(goal, final)
+            self._settle(final)
+            result = self._snapshot(target, result)
+        self._last_offsets = {j: final[j] - target[j] for j in target}
+        return result
+
+    def _step_to(self, start: dict[str, float], end: dict[str, float]) -> None:
+        """Paced goal change between two nearby poses (a static-error correction)."""
+        plan = motion.plan_line(start, end, speed=1.0,
+                                limits=motion.motion_limits(self._manifest_applied), lever={})
+        started = time.monotonic()
+        for index, step in enumerate(plan.steps, start=1):
+            self._check_stop()
+            for joint, rad in step.items():
+                self._protocol.set_position(motor_id=config.JOINTS[joint]["motor_id"],
+                                            ticks=config.rad_to_ticks(joint, rad))
+            remaining = started + index * plan.period_s - time.monotonic()
+            if remaining > 0:
+                time.sleep(remaining)
+
+    def _snapshot(self, target: dict[str, float], previous: MoveResult) -> MoveResult:
+        final = {joint: self._read_joint(joint) for joint in target}
+        max_error = max((abs(final[j] - target[j]) for j in target), default=0.0)
+        return MoveResult(
+            reached=max_error <= self.move_tolerance_rad,
+            final_positions=final,
+            elapsed_s=previous["elapsed_s"],
+            max_error_rad=round(max_error, 5),
+        )
 
     def _apply_manifest(self, manifest_path) -> None:
         """Re-read geometry from a specific manifest, at most once per path.
@@ -639,7 +806,7 @@ class SOArm101Actuator:
             try:
                 # Paced and path-checked like every other motion: the jump to a
                 # table pose is the longest move this loop makes.
-                self._move_paced(safe, timeout_s=3.0)
+                self._move_paced(safe, timeout_s=3.0, correct=False)
             except DeniedError:
                 pass  # the jump would leave the workspace: servo cold, as before
             else:
@@ -669,7 +836,7 @@ class SOArm101Actuator:
             if best_pose is not None and best_error is not None and best_error < error - 1.0:
                 back = {j: best_pose[j] for j in kin.REACH_JOINTS}
                 try:
-                    self._move_paced(back, timeout_s=3.0)
+                    self._move_paced(back, timeout_s=3.0, correct=False)
                 except DeniedError:
                     pass  # no checked way back: stay where the loop stopped
                 else:
@@ -740,7 +907,7 @@ class SOArm101Actuator:
                     pinned.add(joint)
             last_command = dict(safe)
             try:
-                self._move_paced(safe, timeout_s=3.0)
+                self._move_paced(safe, timeout_s=3.0, correct=False)
             except DeniedError as exc:
                 return _give_up(step, error, current,
                                 f"the next step was refused ({exc.code}): {exc.detail}")

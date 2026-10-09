@@ -72,11 +72,16 @@ Found by the EV-03 hostile-model test (software in the loop through robot-md-gat
   segments between samples bounded too); a path that leaves is refused with
   `path_leaves_workspace`. An arm that starts outside may only move in ways that never
   make it worse.
-- **The check is on the commanded path.** A loaded servo settles short of its goal, so
-  the real tip can sit past a face the commanded path only touches (EV-03, simulated with
-  bob's measured sag: up to a few mm below the floor at floor targets).
-  `SO_ARM101_WORKSPACE_MARGIN_MM` keeps the commanded path that far inside every face;
-  set it to the tip error you measure on your arm. Default 0.
+- **Loaded joints are held on target.** A loaded servo settles short of its goal (bob:
+  up to 27 ticks on shoulder_lift), so the real tip can sit past a face the commanded
+  path only touches. After each move the driver offsets each joint's goal by the error
+  it settled with (bounded, a few rounds, never pushing harder on a joint that stops
+  improving) and feeds the sag it learns into later moves. In the EV-03 simulation of
+  bob's sag: error after a move under 1 mm (was 11–13 mm); worst dip below the declared
+  floor 4.6 mm, mid-move onto targets on the floor plane (was 13.6 mm).
+- **The check is still on the commanded path.** `SO_ARM101_WORKSPACE_MARGIN_MM` keeps the
+  commanded path that far inside every face; set it to the tip error you measure on your
+  arm. Default 0.
 - **`arm.reach_point` checks the declared workspace** (it checked only that the links
   could span the point, and walked to z = −101.7 mm), takes the bus lock, and opens the
   port itself (its first call on a fresh gateway used to be an HTTP 500).

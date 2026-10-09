@@ -433,3 +433,56 @@ def test_an_unexpected_driver_exception_becomes_an_error_outcome(fake_clock):
     outcome = _invoke(_actuator(proto), "arm.state", tier="read")
     assert outcome.outcome_kind == "error"
     assert "RuntimeError" in outcome.error_message
+
+
+# --------------------------------------------------------------------------- #
+# Finding: the commanded path was inside, the arm was not (servo static error)
+# --------------------------------------------------------------------------- #
+
+def test_a_joint_that_settles_short_is_held_on_target(fake_clock):
+    """shoulder_lift settles 20 ticks below any goal it is given, as a loaded
+    joint does. The move offsets its goal until the joint sits on target."""
+    proto, goal = _bus(sag={2: 20})
+    actuator = _actuator(proto)
+    target = {"shoulder_lift": config.ticks_to_rad("shoulder_lift", 1760)}  # path stays inside
+
+    result = actuator.move_paced(target)
+
+    assert goal[2] - 20 == pytest.approx(1760, abs=2)      # the joint is on target...
+    assert goal[2] == pytest.approx(1780, abs=2)           # ...because its goal is offset
+    assert result["max_error_rad"] <= 2 * (2 * math.pi / 4096) + 1e-9
+
+
+def test_a_joint_that_cannot_move_is_not_pushed_harder(fake_clock):
+    """A joint held by something it cannot move keeps the same error. The
+    correction gives up and puts the goal back on the target instead of
+    leaving it offset into the obstacle."""
+    proto = MagicMock()
+    goal = dict(READY)
+    proto.set_position.side_effect = lambda motor_id, ticks: goal.__setitem__(motor_id, ticks)
+    stuck = {2: 1800}
+    proto.read_position.side_effect = lambda motor_id: stuck.get(motor_id, goal.get(motor_id))
+    actuator = _actuator(proto)
+    target_ticks = 1740
+    actuator.move_paced({"shoulder_lift": config.ticks_to_rad("shoulder_lift", target_ticks)})
+
+    assert goal[2] == target_ticks
+
+
+def test_a_learned_sag_is_fed_forward_into_the_next_move(fake_clock):
+    """Once a correction has shown how far a loaded joint sags, the next move
+    commands every step with that offset, so the arm does not ride below its
+    path while it moves (EV-03, simulated: 9.4 mm below the floor mid-move
+    without it, 4.6 mm with it)."""
+    proto, goal = _bus(sag={2: 20})
+    actuator = _actuator(proto)
+    actuator.move_paced({"shoulder_lift": config.ticks_to_rad("shoulder_lift", 1760)})
+    assert "shoulder_lift" in actuator._sag_gain
+
+    proto.set_position.reset_mock()
+    actuator.move_paced({"shoulder_lift": config.ticks_to_rad("shoulder_lift", 1740)})
+    first = next(c.kwargs["ticks"] for c in proto.set_position.call_args_list
+                 if c.kwargs["motor_id"] == 2)
+    # The arm sits at 1760 with its goal at ~1780. The first step goes from
+    # there, not from the sagged reading (which would drop it by 20 ticks).
+    assert first >= 1770
