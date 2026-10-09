@@ -225,14 +225,49 @@ _BUS_LOCK = threading.Lock()
 _TRANSPORT_LOCK = threading.Lock()
 
 
+#: How many stops are waiting for the bus right now. While any is, every other
+#: request gives way: Python's lock is not first-come-first-served, so a stream
+#: of polls could otherwise keep taking the bus ahead of a stop that is already
+#: latched but has not yet sent its hold (4 s late under 120 looping clients,
+#: found in review).
+_STOPS_WAITING = 0
+_STOPS_WAITING_LOCK = threading.Lock()
+
+
+def _busy() -> DeniedError:
+    return DeniedError(
+        "busy",
+        "the arm is carrying out another command, and commands are refused rather than "
+        "queued while it does. Try again when it has finished.")
+
+
 @contextlib.contextmanager
-def _bus(timeout_s: float):
-    """Hold the servo bus, or refuse as busy after ``timeout_s``."""
-    if not _BUS_LOCK.acquire(timeout=timeout_s):
-        raise DeniedError(
-            "busy",
-            "the arm is carrying out another command, and commands are refused rather than "
-            "queued while it does. Try again when it has finished.")
+def _bus(timeout_s: float, *, stop: bool = False):
+    """Hold the servo bus, or refuse as busy after ``timeout_s``.
+
+    ``stop=True`` goes first: while a stop waits, any other request that has
+    not got the bus is refused at once, and one that gets it hands it straight
+    back, so the stop needs only the request already holding the bus to finish
+    (a paced move ends at its next setpoint once the stop has latched).
+    """
+    global _STOPS_WAITING
+    if stop:
+        with _STOPS_WAITING_LOCK:
+            _STOPS_WAITING += 1
+        try:
+            acquired = _BUS_LOCK.acquire(timeout=timeout_s)
+        finally:
+            with _STOPS_WAITING_LOCK:
+                _STOPS_WAITING -= 1
+    else:
+        if _STOPS_WAITING:
+            raise _busy()
+        acquired = _BUS_LOCK.acquire(timeout=timeout_s)
+        if acquired and _STOPS_WAITING:
+            _BUS_LOCK.release()
+            raise _busy()
+    if not acquired:
+        raise _busy()
     try:
         yield
     finally:
@@ -595,13 +630,20 @@ class SOArm101Actuator:
     def _holding_ticks(self, joint: str, present: int) -> int:
         """The goal this joint is holding, if it is holding one; else where it reads.
 
-        The goal is the one this actuator last sent, or, before it has sent any
-        (a fresh gateway), the servo's own Goal_Position register.
+        The goal is the servo's own Goal_Position register: what it is really
+        aiming at. The copy this actuator kept of what it last sent is used
+        only when the servo cannot say. A brown-out can reset the register to
+        wherever the joint fell, and a move planned from the stale copy starts
+        by re-commanding it, in one unpaced jump (50 ticks at 1.5 m/s at the
+        tip, found in review in simulation).
         """
-        ref = self._reference.get(joint)
-        if ref is None:
-            ref = self._read_goal_register(joint)
-        return ref if ref is not None and abs(present - ref) <= ADOPT_REFERENCE_TICKS else present
+        return self._choose_hold(joint, present, self._read_goal_register(joint))
+
+    def _choose_hold(self, joint: str, present: int, register: int | None) -> int:
+        """The goal register if it is near the reading, else the reading. Falls
+        back to the copy of what was last sent only when the register is None."""
+        goal = register if register is not None else self._reference.get(joint)
+        return goal if goal is not None and abs(present - goal) <= ADOPT_REFERENCE_TICKS else present
 
     def _read_goal_register(self, joint: str) -> int | None:
         """Goal_Position as the servo reports it, or None when it cannot say."""
@@ -636,8 +678,8 @@ class SOArm101Actuator:
         commanded to stay where the move starts (their reference, or their
         reading when they are not holding one) and are reported like the rest.
 
-        ``taught_goal`` is for a pose the operator taught (arm.home, arm.reach),
-        which may sit inside the workspace margin; see :func:`motion.check_line`.
+        ``taught_goal`` is for the pose the operator taught (arm.home), which
+        may sit inside the workspace margin; see :func:`motion.check_line`.
 
         Every setpoint is converted to ticks before the first one is sent, so a
         conversion that fails cannot leave a move half-written. A joint that
@@ -751,31 +793,36 @@ class SOArm101Actuator:
     def _hold_pose(self) -> dict[str, int]:
         """Hold every joint, and return the ticks held.
 
-        The first hold after the stop latches chooses the goals: the goal a
-        joint is holding when it is holding one (within ADOPT_REFERENCE_TICKS;
-        see :meth:`_holding_ticks`), otherwise where it reads. Every later hold
-        re-sends exactly those ticks. Re-reading instead walks a loaded arm down
-        by its sag on every stop (the ratchet: 9 cm in 8 s of repeated stops in
-        EV-03's simulation).
+        The first hold after the stop latches chooses each joint's goal: the
+        goal its servo is holding, when that is near where it reads (within
+        ADOPT_REFERENCE_TICKS; see :meth:`_holding_ticks`), so the stop moves
+        nothing; otherwise where it reads (it was moving, or it was pushed).
+
+        Every later hold re-sends those ticks for as long as the servo still
+        holds them, however far the arm has sagged from them. Re-anchoring to
+        the reading walks a loaded arm down by its sag on every stop: the
+        ratchet, 9 cm in 8 s of repeated stops in EV-03's simulation, and back
+        again in review for an arm whose sag passes the adoption window (at
+        five times bob's sag, z = 112 to -103 mm in ten stops). A joint whose
+        servo no longer holds them (a brown-out reset its goal to wherever it
+        fell) is chosen again from what it holds now: re-sending the old goal
+        would drive it back unpaced (40 mm at 0.38 m/s, in simulation).
+
+        A servo that cannot report its goal register is taken to still hold
+        what was sent: that cannot detect a reset, but it cannot ratchet.
         """
-        if self._held is None:
-            held: dict[str, int] = {}
-            for joint, spec in config.JOINTS.items():
-                present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
-                held[joint] = self._holding_ticks(joint, present)
-            self._held = held
-        else:
-            # A held goal is re-sent only while the joint is still holding it.
-            # A joint now far from it (a power cycle reset its goal and the arm
-            # dropped) is held where it is: re-sending the old goal would drive
-            # it back at the servo's top speed (2.4 m/s at the tip, in sim).
-            for joint, spec in config.JOINTS.items():
-                present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
-                if abs(present - self._held[joint]) > ADOPT_REFERENCE_TICKS:
-                    self._held[joint] = present
-        for joint, ticks in self._held.items():
+        chosen: dict[str, int] = dict(self._held) if self._held is not None else {}
+        for joint, spec in config.JOINTS.items():
+            present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
+            register = self._read_goal_register(joint)
+            kept = chosen.get(joint)
+            if kept is not None and (register is None or register == kept):
+                continue
+            chosen[joint] = self._choose_hold(joint, present, register)
+        self._held = chosen
+        for joint, ticks in chosen.items():
             self._write_goal(joint, ticks)
-        return dict(self._held)
+        return dict(chosen)
 
     def _apply_manifest(self, manifest_path) -> None:
         """Re-read geometry from a specific manifest, at most once per path.
@@ -850,7 +897,10 @@ class SOArm101Actuator:
                 result = self._move_checked(pose, timeout_s=3.0)
             except DeniedError as exc:
                 refused.setdefault("code", exc.code)
-                return f"the next step was refused: {exc.detail}"
+                # The check's own "Nothing was moved." is true of this step only;
+                # _give_up says what the call as a whole did.
+                detail = exc.detail.replace(" Nothing was moved.", "").rstrip()
+                return f"the next step was refused: {detail}"
             except OutOfRangeError as exc:
                 refused.setdefault("code", "joint_limits")
                 return f"the next step was refused: {exc}"
@@ -934,6 +984,10 @@ class SOArm101Actuator:
                    "final_positions": current}
             if why.startswith("the next step was refused") and "code" in refused:
                 out["refused"] = refused["code"]
+                moved = step > 0 or warm_started
+                out["stopped_because"] = why + (
+                    " That step was not taken; the steps before it in this call did move the "
+                    "arm, to final_positions." if moved else " Nothing was moved.")
             return out
 
         for step in range(max_iterations):
@@ -1339,8 +1393,9 @@ class SOArm101Actuator:
             try:
                 # Same lock every move takes: the hold writes a setpoint per
                 # joint, and a read interleaved into that sequence corrupts both.
-                # A move in progress lets go within one pace period of the latch.
-                with _bus(STOP_BUS_WAIT_S):
+                # A move in progress lets go within one pace period of the latch,
+                # and while the stop waits every other request gives way to it.
+                with _bus(STOP_BUS_WAIT_S, stop=True):
                     transport.estop()
                     held = {joint: _config_module.ticks_to_rad(joint, ticks)
                             for joint, ticks in (self._held or {}).items()}
@@ -1396,12 +1451,19 @@ class SOArm101Actuator:
             # Fail closed on geometry. A manifest whose geometry could not be
             # read leaves the workspace, the chain and the limits resolving to
             # nothing, and the move would go unchecked.
+            # Asked on every motion, not once per path: the file can change under
+            # a running gateway (a re-signed manifest), and a YAML error reads as
+            # an empty manifest everywhere else, which declares no workspace.
             key = str(manifest_path) if manifest_path else ""
-            if key and self._manifest_error is not None and self._manifest_error[0] == key:
-                return _denied(DeniedError(
-                    "manifest_unreadable",
-                    f"this robot's geometry could not be read from {key} "
-                    f"({self._manifest_error[1]}), so no motion can be checked against it"))
+            if key:
+                problem = (self._manifest_error[1]
+                           if self._manifest_error is not None and self._manifest_error[0] == key
+                           else kin.frontmatter_problem(key))
+                if problem:
+                    return _denied(DeniedError(
+                        "manifest_unreadable",
+                        f"this robot's geometry could not be read from {key} ({problem}), "
+                        f"so no motion can be checked against it"))
 
         # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
         # stay unmapped: they need the vision rig, and the gateway deny-lists
@@ -1488,7 +1550,9 @@ class SOArm101Actuator:
                 )
             reach_pose = self._home_pose_for_motion()
             reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
-            tool_name, tool_args, taught = "move", {"joint_positions": reach_pose}, True
+            # Derived from the taught pose, not taught itself: it gets no
+            # allowance for sitting inside the margin.
+            tool_name, tool_args = "move", {"joint_positions": reach_pose}
         if tool_name == "move":
             # Every joint move the gateway can ask for (arm.home, arm.reach, a
             # bare `move`) is checked against the workspace and paced, exactly

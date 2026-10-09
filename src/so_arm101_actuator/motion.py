@@ -132,6 +132,10 @@ def _floor(first: float, last: float, margin_mm: float) -> float:
     there for model error the plan cannot see, so a move that leaves the band
     still keeps what it can of it. A point already past the face may go
     RECOVERY_DIP_MM further only on a move that ends a full margin inside.
+
+    "Never past the face" is as planned. The friction flip at the start of a
+    move can beat the plan by a millimetre or two, which only the margin
+    covers, and a point inside the band has less than the margin by definition.
     """
     if first >= margin_mm:
         return margin_mm
@@ -153,11 +157,11 @@ def check_line(chain: Chain, box: Box | None, start: dict[str, float], goal: dic
     and friction and does not go away while it moves). Clearance is kept per
     face of the box, and each face is held to :func:`_floor`.
 
-    ``taught_goal`` is for a pose the operator taught (arm.home, arm.reach): it
-    may sit inside the margin, as bob's ready pose does (7.6 mm from x = 340), so
-    on a face the goal is that close to, the path may come as close as the goal
-    itself or half the margin, whichever is closer, and no closer than that. The
-    goal must be inside the box as commanded.
+    ``taught_goal`` is for the pose the operator taught (arm.home): it may sit
+    inside the margin, as bob's ready pose does (7.6 mm from x = 340), so on a
+    face the goal is that close to, the path may come as close as the goal
+    itself or half the margin, whichever is closer, less START_DIP_MM, and never
+    past the face (as planned). The goal must be inside the box as commanded.
 
     Returns the closest clearance seen and where. Raises DeniedError
     ``path_leaves_workspace`` naming the first sample that fails.
@@ -197,7 +201,7 @@ def check_line(chain: Chain, box: Box | None, start: dict[str, float], goal: dic
             if taught_goal and last < margin_mm:
                 # A taught pose inside the margin: the path may come as close
                 # as the pose itself, or to half the margin, less the start-up
-                # allowance for the approach, and never past the face.
+                # allowance for the approach, and never past the face as planned.
                 floor = min(floor, max(0.0, min(last, margin_mm / 2.0) - START_DIP_MM))
             for i, rowc in enumerate(rows):
                 c = rowc[face]

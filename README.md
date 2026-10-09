@@ -263,13 +263,22 @@ arrived, several millimetres at the tip), servo lag and tick rounding.
 Starting closer than the margin, a point may come no closer to that face, unless
 the move takes it a full margin away, in which case it keeps half the margin
 on the way (or, starting closer than that, may come 1 mm closer than it started,
-never past the face: the first millimetre of almost any line out of a pose
-points the tip a little the wrong way). An arm already past a face (pushed
-out, or parked badly) may go up to 2 mm further past that face, and no other,
-on a move that ends a full margin inside. A pose the operator taught (`arm.home`,
-`arm.reach`) may sit inside the margin; the path to it may come as close as the
-pose itself, or half the margin, and the pose itself must be inside the box. A
-refusal is `path_leaves_workspace` with no motion.
+never past the face as planned: the first millimetre of almost any line out of
+a pose points the tip a little the wrong way). An arm already past a face
+(pushed out, or parked badly) may go up to 2 mm further past that face, and no
+other, on a move that ends a full margin inside. The pose the operator taught
+(`arm.home`) may sit inside the margin; the path to it may come as close as the
+pose itself or half the margin, whichever is closer, less 1 mm, and the pose
+itself must be inside the box. A refusal is `path_leaves_workspace` with no
+motion.
+
+Inside the margin band the plan is all there is, and the plan can be beaten:
+when a move starts, each joint's friction flips to the other side of its goal,
+which the prediction (measured at rest) cannot see. In the review's probes
+(simulation, bob's sag and friction fit, a stiff servo), 4 of 41 moves out of
+bob's ready pose, which sits 1.6 mm from x = 340 once it sags, crossed that face
+by up to 0.8 mm. Do not teach a pose inside the margin: from a full margin
+inside, the same error stays inside the box.
 
 The margin has a cost: no target closer than 10 mm to a face is accepted, as
 commanded or as predicted. The prediction carries today's offset unchanged to
@@ -312,16 +321,32 @@ way back in; every setpoint is converted before the first is sent.
 
 **The stop interrupts, and holds without walking the arm down.** `arm.estop`
 latches before it waits for the bus, and a paced move checks the latch before
-every setpoint, so a move in progress ends within one period. Every other
-request waits at most 1 s for the bus and is then refused as `busy`: commands
-are not queued behind a running move, and a queue of them could otherwise take
-every gateway worker thread and leave the stop without one. The hold picks each
-joint's goal once per latch (the goal it is holding, or where it is when it is
-not holding one) and a repeated stop re-sends the same goals, unless a joint is
-no longer anywhere near its held goal (a power cycle reset it and the arm
-dropped), in which case that joint is held where it is. The stop used to re-read
-the encoders every time, and under gravity every repeat lowered the arm by its
-sag: 9 cm in 8 s of stops 0.2 s apart in simulation.
+every setpoint, so a move in progress ends within one period. While a stop waits
+for the bus, every other request is refused as `busy` at once (one that gets the
+bus first hands it straight back), and otherwise a request waits at most 1 s for
+the bus and is then refused: commands are not queued behind a running move.
+(robot-md-gateway runs stop tools on worker threads of their own, so a burst of
+other requests cannot hold the stop back before it gets here either.)
+
+The hold picks each joint's goal once per latch: the goal its servo is holding
+(read back from the servo's Goal_Position register), when the joint reads within
+100 ticks of it, so the stop moves nothing; otherwise where the joint is (it was
+moving, or it was pushed, or it is stalled against something). A repeated stop
+re-sends those goals for as long as the servo still holds them, however far the
+arm has sagged from them, and chooses again only for a joint whose servo no
+longer does (a brown-out reset its goal to wherever it fell), from what that
+servo holds now. The stop used to re-read the encoders every time, and under
+gravity every repeat lowered the arm by its sag: 9 cm in 8 s of stops 0.2 s
+apart in simulation, and again, in review, for an arm sagging more than the 100
+ticks. Moves are planned from the same register for the same reason: planned
+from a stale copy, the first setpoint after a brown-out re-commanded the old
+goal in one unpaced jump.
+
+One cost remains for an arm whose sag passes 100 ticks (about 9 degrees; five
+times bob's): the first stop cannot tell that sag from a stall, holds the joint
+where it reads, and the arm drops once by its sag (59 mm at the tip in
+simulation) before it holds. The register cannot tell the two apart; a load or
+speed reading could.
 
 **`arm.reach_point` respects the workspace.** Targets less than the margin
 inside the box are refused (`out_of_workspace`), and every step it takes is a

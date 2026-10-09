@@ -140,11 +140,10 @@ def test_metadata_attributes():
 
 
 def test_execute_dispatches_move(fake_clock):
-    from pathlib import Path
     actuator, proto = _make_actuator(present_positions={1: 2048})
     outcome = actuator.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"shoulder_pan": 0.0}, "timeout_s": 0.1}},
-        manifest_path=Path("/tmp/dummy.md"),
+        manifest_path="",  # no manifest: a path that cannot be read refuses motion
         tier="actuate",
         config={},
     )
@@ -154,11 +153,10 @@ def test_execute_dispatches_move(fake_clock):
 
 
 def test_execute_dispatches_home(fake_clock):
-    from pathlib import Path
     actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
     outcome = actuator.execute(
         envelope={"tool_name": "home", "tool_args": {"timeout_s": 0.1}},
-        manifest_path=Path("/tmp/dummy.md"),
+        manifest_path="",  # no manifest: a path that cannot be read refuses motion
         tier="actuate",
         config={},
     )
@@ -195,12 +193,11 @@ def test_execute_unknown_capability_returns_error_outcome():
 
 
 def test_execute_actuator_exception_becomes_error_outcome():
-    from pathlib import Path
     actuator, proto = _make_actuator()
     proto.read_position.side_effect = RuntimeError("bus jammed")
     outcome = actuator.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"shoulder_pan": 0.0}}},
-        manifest_path=Path("/tmp/dummy.md"),
+        manifest_path="",  # no manifest: a path that cannot be read refuses motion
         tier="actuate",
         config={},
     )
@@ -212,11 +209,10 @@ def test_execute_actuator_exception_becomes_error_outcome():
 def test_an_unknown_joint_is_a_refusal_not_a_fault():
     """Refusing to move a joint that does not exist is a decision (a signed
     403), not the robot breaking (a 500)."""
-    from pathlib import Path
     actuator, proto = _make_actuator()
     outcome = actuator.execute(
         envelope={"tool_name": "move", "tool_args": {"joint_positions": {"not_a_joint": 0.0}}},
-        manifest_path=Path("/tmp/dummy.md"),
+        manifest_path="",  # no manifest: a path that cannot be read refuses motion
         tier="actuate",
         config={},
     )

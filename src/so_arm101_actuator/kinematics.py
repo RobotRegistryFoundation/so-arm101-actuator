@@ -73,13 +73,53 @@ def chain_from_manifest(path: str | None = None) -> list[dict]:
     return _read_chain(path)
 
 
-#: Parsed frontmatter by path -> (mtime, dict). The closed-loop reach evaluates
-#: forward kinematics nine times per step, each of which asks the manifest for
-#: the chain, and a Cartesian solve asks four more questions of it. Re-reading
-#: and re-parsing a 300-line YAML document every time made a workspace sweep
-#: take minutes of pure parsing. Keyed on mtime so a re-signed manifest is
-#: picked up without a restart, exactly as the gateway's own cache does it.
-_FRONTMATTER_CACHE: dict[str, tuple[float, dict]] = {}
+#: Parsed frontmatter by path -> (mtime, dict, problem). The closed-loop reach
+#: evaluates forward kinematics nine times per step, each of which asks the
+#: manifest for the chain, and a Cartesian solve asks four more questions of it.
+#: Re-reading and re-parsing a 300-line YAML document every time made a
+#: workspace sweep take minutes of pure parsing. Keyed on mtime so a re-signed
+#: manifest is picked up without a restart, exactly as the gateway's own cache
+#: does it.
+_FRONTMATTER_CACHE: dict[str, tuple[float, dict, str | None]] = {}
+
+
+def _parse_frontmatter(source: str) -> tuple[dict, str | None]:
+    """The frontmatter at `source`, and why it could not be read (or None)."""
+    import os
+    from pathlib import Path
+
+    try:
+        mtime = os.path.getmtime(source)
+    except OSError as exc:
+        return {}, f"it cannot be read ({exc.strerror or exc})"
+    cached = _FRONTMATTER_CACHE.get(source)
+    if cached is not None and cached[0] == mtime:
+        return cached[1], cached[2]
+    try:
+        text = Path(source).read_text()
+    except (OSError, UnicodeDecodeError) as exc:
+        return {}, f"it cannot be read ({exc})"
+    front: dict = {}
+    problem: str | None = None
+    end = text.find("\n---", 3) if text.startswith("---") else -1
+    if not text.startswith("---"):
+        problem = "it has no YAML frontmatter (it does not start with ---)"
+    elif end == -1:
+        problem = "its YAML frontmatter is never closed (no second ---)"
+    else:
+        try:
+            import yaml
+
+            parsed = yaml.safe_load(text[3:end])
+        except Exception as exc:  # noqa: BLE001 — any parse failure is the same answer
+            problem = f"its YAML frontmatter does not parse ({str(exc).splitlines()[0]})"
+        else:
+            if parsed is None or isinstance(parsed, dict):
+                front = parsed or {}
+            else:
+                problem = "its YAML frontmatter is not a mapping"
+    _FRONTMATTER_CACHE[source] = (mtime, front, problem)
+    return front, problem
 
 
 def frontmatter(path: str | None = None) -> dict:
@@ -88,41 +128,33 @@ def frontmatter(path: str | None = None) -> dict:
     One parser for the whole module. Every geometry question below — the chain,
     the workspace box, the declared IK provider, the tool on the end — is a
     lookup in this dict, so a manifest that cannot be read fails the same way
-    everywhere instead of once per feature.
+    everywhere instead of once per feature. Reads are lenient ({} for a file
+    that cannot be read); motion asks :func:`frontmatter_problem` first.
 
     The returned dict is the cached object, not a copy: this is a read-only
     view of a file, and callers that mutate it are lying to every later reader.
     """
     import os
-    from pathlib import Path
 
     source = path or os.environ.get(config.MANIFEST_ENV, "")
     if not source:
         return {}
-    try:
-        mtime = os.path.getmtime(source)
-    except OSError:
-        return {}
-    cached = _FRONTMATTER_CACHE.get(source)
-    if cached is not None and cached[0] == mtime:
-        return cached[1]
-    try:
-        text = Path(source).read_text()
-    except OSError:
-        return {}
-    front: dict = {}
-    if text.startswith("---"):
-        end = text.find("\n---", 3)
-        if end != -1:
-            try:
-                import yaml
+    return _parse_frontmatter(source)[0]
 
-                parsed = yaml.safe_load(text[3:end]) or {}
-                front = parsed if isinstance(parsed, dict) else {}
-            except Exception:
-                front = {}
-    _FRONTMATTER_CACHE[source] = (mtime, front)
-    return front
+
+def frontmatter_problem(path: str | None = None) -> str | None:
+    """Why the manifest's frontmatter cannot be read, or None when it can.
+
+    A broken manifest reads as {} everywhere, and {} declares no workspace and
+    no chain, so every check that asks it passes. Motion must not take that
+    for a manifest that declares nothing: it asks this first and refuses.
+    """
+    import os
+
+    source = path or os.environ.get(config.MANIFEST_ENV, "")
+    if not source:
+        return None
+    return _parse_frontmatter(source)[1]
 
 
 def _read_chain(path: str | None = None) -> list[dict]:

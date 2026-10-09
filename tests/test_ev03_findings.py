@@ -447,7 +447,9 @@ def test_the_stop_latches_even_while_another_request_holds_the_bus(monkeypatch):
 
 def test_a_repeated_stop_does_not_drive_a_joint_back_to_a_goal_it_has_lost():
     """After a stop, a power cycle resets a servo's goal and the arm drops.
-    Re-sending the old hold would drive it back at top speed (2.4 m/s in sim)."""
+    Re-sending the old hold would drive it back at top speed (2.4 m/s in sim);
+    holding where it reads would lower the goal by the sag. It holds the goal
+    the servo now holds, which moves nothing."""
     bus = _SaggingBus()
     actuator = SOArm101Actuator(protocol=bus)
     _estop(actuator)
@@ -456,7 +458,64 @@ def test_a_repeated_stop_does_not_drive_a_joint_back_to_a_goal_it_has_lost():
     bus.writes.clear()
     _estop(actuator)
     assert (lift, 2048) not in bus.writes
-    assert (lift, 1500 - bus.sag) in bus.writes
+    assert (lift, 1500) in bus.writes
+
+
+def test_a_reset_inside_the_adoption_window_is_not_driven_back_either():
+    """The first version re-sent the old hold whenever the joint read within
+    100 ticks of it, so a 50-tick reset still lifted the arm 40 mm unpaced."""
+    bus = _SaggingBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    _estop(actuator)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    bus.goal[lift] = 2048 - 50
+    bus.writes.clear()
+    _estop(actuator)
+    assert (lift, 2048) not in bus.writes
+    assert (lift, 2048 - 50) in bus.writes
+
+
+def test_repeated_stops_never_ratchet_an_arm_whose_sag_passes_the_adoption_window():
+    """Found in review: a joint sagging more than ADOPT_REFERENCE_TICKS was
+    re-anchored at its reading on every repeat, and five times bob's sag walked
+    the tip from z = 112 to -103 mm in ten stops. The first stop may hold it
+    where it reads (it cannot tell a heavy sag from a move); no later one moves
+    the goal again."""
+    bus = _SaggingBus(sag=ADOPT_REFERENCE_TICKS + 60)
+    actuator = SOArm101Actuator(protocol=bus)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    _estop(actuator)
+    first = bus.goal[lift]
+    for _ in range(50):
+        assert _estop(actuator).success
+    assert {ticks for motor, ticks in bus.writes if motor == lift} == {first}
+
+
+def test_without_a_goal_register_repeated_stops_still_never_ratchet():
+    class _NoRegister(_SaggingBus):
+        read_goal_position = None             # a bus that cannot report it
+
+    bus = _NoRegister(sag=ADOPT_REFERENCE_TICKS + 60)
+    actuator = SOArm101Actuator(protocol=bus)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    _estop(actuator)
+    first = bus.goal[lift]
+    for _ in range(20):
+        _estop(actuator)
+    assert bus.goal[lift] == first
+
+
+def test_a_move_after_a_goal_reset_plans_from_the_register_not_the_stale_copy(fake_clock):
+    """Found in review: planning from the copy of the last goal sent, after a
+    brown-out reset the servo's goal 50 ticks away, gave a zero-length plan
+    whose one setpoint jumped the arm back at 1.5 m/s."""
+    bus = _SaggingBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    actuator._write_goal("shoulder_lift", 2048)          # what this process last sent
+    bus.goal[lift] = 2048 - 50                            # the reset
+    start, offset = actuator._planning_start(["shoulder_lift"])
+    assert config.rad_to_ticks("shoulder_lift", start["shoulder_lift"]) == 2048 - 50
 
 
 def test_a_stall_makes_the_move_longer_never_faster(fake_clock):
@@ -525,9 +584,9 @@ def test_arm_home_brings_the_arm_home_though_the_taught_pose_is_inside_the_margi
     home = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
                             manifest_path=Path(M), tier="actuate", config={})
     assert home.outcome_kind == "executed", home.error_message
-    # It may come as close as the taught pose itself, or half the margin, but
-    # no closer.
-    assert home.telemetry["motion"]["path_min_clearance_mm"] >= 5.0
+    # It may come as close as the taught pose itself (7.6 mm) or half the
+    # margin (5 mm), whichever is closer, less START_DIP_MM: 4 mm, no closer.
+    assert home.telemetry["motion"]["path_min_clearance_mm"] >= 4.0
 
 
 def test_a_taught_pose_outside_the_workspace_is_refused_with_the_fix_named(tmp_path, fake_clock):
@@ -665,3 +724,202 @@ def test_a_joint_target_past_its_configured_range_never_reaches_the_bus(fake_clo
     with pytest.raises(ValueError):
         actuator._move_checked({"shoulder_pan": beyond}, speed=1.0, timeout_s=5.0)
     proto.set_position.assert_not_called()
+
+
+# --------------------------------------------------------------------------- #
+# Found by the second review
+# --------------------------------------------------------------------------- #
+
+def test_while_a_stop_waits_for_the_bus_every_other_request_gives_way(monkeypatch):
+    """Python's lock is not first-come-first-served: under 120 looping clients
+    the stop's hold went out 4 s after it latched. Now a request that has not
+    got the bus while a stop waits is refused at once, not after BUS_WAIT_S."""
+    import threading
+    import time as real_time
+
+    monkeypatch.setattr(act_mod, "BUS_WAIT_S", 2.0)
+    monkeypatch.setattr(act_mod, "STOP_BUS_WAIT_S", 5.0)
+    bus = _SaggingBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    done: list = []
+    act_mod._BUS_LOCK.acquire()                         # a move is holding the bus
+    try:
+        stopper = threading.Thread(target=lambda: done.append(_estop(actuator)))
+        stopper.start()
+        deadline = real_time.monotonic() + 2.0
+        while not act_mod._STOPS_WAITING and real_time.monotonic() < deadline:
+            real_time.sleep(0.001)
+        assert act_mod._STOPS_WAITING == 1
+        started = real_time.monotonic()
+        poll = actuator.execute(envelope={"tool_name": "arm.state", "tool_args": {}},
+                                manifest_path="", tier="read", config={})
+        assert real_time.monotonic() - started < 0.5      # not BUS_WAIT_S
+        assert poll.telemetry["deny"] == "busy"
+    finally:
+        act_mod._BUS_LOCK.release()
+    stopper.join(timeout=5.0)
+    assert done and done[0].success
+    assert act_mod._STOPS_WAITING == 0
+
+
+def test_a_request_already_waiting_when_a_stop_arrives_hands_the_bus_back(monkeypatch):
+    import threading
+    import time as real_time
+
+    outcome: list = []
+
+    def waiter():
+        try:
+            with act_mod._bus(5.0):
+                outcome.append("took the bus")
+        except DeniedError as exc:
+            outcome.append(exc.code)
+
+    act_mod._BUS_LOCK.acquire()                          # a move holds the bus
+    thread = threading.Thread(target=waiter)
+    thread.start()
+    real_time.sleep(0.05)                                # the poll is now waiting for it
+    monkeypatch.setattr(act_mod, "_STOPS_WAITING", 1)    # and then a stop arrives
+    act_mod._BUS_LOCK.release()
+    thread.join(timeout=5.0)
+    assert outcome == ["busy"]
+    assert act_mod._BUS_LOCK.acquire(blocking=False)     # handed straight back
+    act_mod._BUS_LOCK.release()
+
+
+def test_a_request_arriving_while_a_stop_waits_is_refused_without_waiting(monkeypatch):
+    monkeypatch.setattr(act_mod, "_STOPS_WAITING", 1)
+    with pytest.raises(DeniedError) as exc, act_mod._bus(5.0):
+        pass
+    assert exc.value.code == "busy"
+
+
+@pytest.mark.parametrize("broken", [
+    "---\nmetadata:\n\trobot_name: tab\n---\n",           # a stray tab: YAML refuses it
+    "no frontmatter at all\n",
+    "---\nmetadata: {robot_name: never-closed}\n",
+    "---\n- a\n- list\n---\n",
+])
+def test_a_manifest_that_does_not_parse_refuses_motion(tmp_path, fake_clock, broken):
+    """Found in review: frontmatter YAML could not parse read as an empty
+    manifest, which declares no workspace and no chain, and a shoulder swing
+    executed with no path check at all."""
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(broken)
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=manifest, tier="actuate", config={})
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "manifest_unreadable"
+    proto.set_position.assert_not_called()
+
+
+def test_a_manifest_broken_after_it_was_read_refuses_motion_too(tmp_path, fake_clock):
+    """The geometry is applied once per path, but the file can change under a
+    running gateway (re-signed): motion asks again every time."""
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(Path(M).read_text())
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(str(manifest))
+    broken = Path(M).read_text().replace("metadata:\n", "metadata:\n\t", 1)
+    manifest.write_text(broken)
+    os.utime(manifest, (1, 1))                            # a different mtime, whatever the clock
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=manifest, tier="actuate", config={})
+    assert outcome.telemetry.get("deny") == "manifest_unreadable", outcome
+    proto.set_position.assert_not_called()
+
+
+def test_reads_still_answer_from_a_manifest_that_does_not_parse(tmp_path):
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text("---\nmetadata:\n\trobot_name: tab\n---\n")
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.state", "tool_args": {}},
+                               manifest_path=manifest, tier="read", config={})
+    assert outcome.outcome_kind == "executed"
+
+
+def test_a_reach_point_refused_after_earlier_steps_says_the_arm_moved(monkeypatch, fake_clock):
+    """Found in review: the deny said "Nothing was moved." after 45 goal writes."""
+    proto = MagicMock(read_position=MagicMock(return_value=2048))
+    actuator = SOArm101Actuator(protocol=proto)
+    calls = {"n": 0}
+
+    def step(pose, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            return {"reached": True, "final_positions": dict(pose), "max_error_rad": 0.0,
+                    "motion": {"stopped_by_estop": False}}
+        raise DeniedError("path_leaves_workspace", "the tip would come 3 mm from z>=0. Nothing was moved.")
+
+    monkeypatch.setattr(actuator, "_move_checked", step)
+    monkeypatch.setattr(actuator, "_settle", lambda pose: None)
+    outcome = _reach(actuator, [200.0, 0.0, 120.0])
+    assert outcome.outcome_kind == "denied"
+    reason = outcome.telemetry["reason"]
+    assert "Nothing was moved" not in reason
+    assert "did move the arm" in reason
+
+
+def test_only_the_taught_pose_gets_the_taught_allowance(monkeypatch):
+    actuator = SOArm101Actuator(protocol=MagicMock(read_position=MagicMock(return_value=2048)))
+    seen: dict = {}
+
+    def record(joint_positions, **kwargs):
+        seen[len(seen)] = kwargs.get("taught_goal")
+        return {"reached": True, "final_positions": dict(joint_positions), "max_error_rad": 0.0,
+                "elapsed_s": 0.0, "motion": {"stopped_by_estop": False}}
+
+    monkeypatch.setattr(actuator, "_move_checked", record)
+    for tool in ("arm.home", "arm.reach"):
+        actuator.execute(envelope={"tool_name": tool, "tool_args": {}},
+                         manifest_path=Path(M), tier="actuate", config={})
+    assert seen == {0: True, 1: False}
+
+
+def test_a_step_off_the_joint_range_cannot_be_converted():
+    with pytest.raises(ValueError):
+        SOArm101Actuator._ticks_on_path("shoulder_pan", 10.0, 0.0)
+
+
+def test_settle_returns_once_the_arm_reads_still(fake_clock):
+    proto = MagicMock(read_position=MagicMock(return_value=2100))
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._settle({"shoulder_pan": 0.0})                 # still, though not on target
+    assert proto.read_position.call_count >= 2
+
+
+def test_arrival_is_polled_until_the_arm_gets_there(fake_clock):
+    class _Lagging(_SaggingBus):
+        """Reaches each goal only after a few rounds of reads."""
+
+        def __init__(self):
+            super().__init__(sag=0)
+            self.reads = 0
+
+        def set_position(self, motor_id, ticks):
+            super().set_position(motor_id, ticks)
+            self.reads = 0
+
+        def read_position(self, motor_id):
+            self.reads += 1
+            return self.goal[motor_id] if self.reads > 3 * 6 else self.goal[motor_id] - 200
+
+    bus = _Lagging()
+    actuator = SOArm101Actuator(protocol=bus)
+    result = actuator._move_checked({"shoulder_pan": 0.05}, speed=1.0, timeout_s=5.0)
+    assert result["reached"] is True
+
+
+def test_releasing_a_handle_is_best_effort():
+    class _Gone:
+        is_open = False
+
+        def close(self):
+            raise OSError("already gone")
+
+    act_mod._release_serial(None)
+    act_mod._release_serial(_Gone())                        # neither raises

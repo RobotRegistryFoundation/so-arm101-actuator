@@ -25,9 +25,9 @@ nothing bounded speed.
   as commanded and as the arm will really be (commanded + its current offset),
   with a margin (`SO_ARM101_WORKSPACE_MARGIN_MM`, default 10 mm) kept per face
   (a move leaving the band keeps half of it, or comes at most 1 mm closer and
-  never past the face when it starts nearer than that; an arm past a face may go 2 mm
-  further on that face only, on its way back in; a taught pose inside the
-  margin can still be reached), and streamed as setpoints at least 20 ms apart
+  never past the face, as planned, when it starts nearer than that; an arm past
+  a face may go 2 mm further on that face only, on its way back in; the taught
+  pose can be reached though it is inside the margin), and streamed as setpoints at least 20 ms apart
   (never catching up after a stall) under the declared speed limits. New deny
   codes: `path_leaves_workspace`, `too_slow`, `busy`, `manifest_unreadable`.
   **No target closer than the margin to a face is accepted.**
@@ -41,13 +41,18 @@ nothing bounded speed.
   close the path came to a face and whether a stop ended it.
 - **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
   waits for the bus lock, a paced move checks the latch before every setpoint,
-  and every other request waits at most 1 s for the bus before it is refused as
-  `busy`, so queued requests cannot take every gateway thread from the stop. The
-  hold re-sends the goals it chose for this latch instead of re-reading the
-  sagged encoders on every repeat (which walked the arm down 9 cm in 8 s in
-  simulation), except for a joint that has since moved far from its held goal,
-  which is held where it is. It holds the goal a joint is holding (within 100
-  ticks), not its sag.
+  every other request gives way while a stop waits for the bus, and otherwise
+  waits at most 1 s before it is refused as `busy`. The hold re-sends the goals
+  it chose for this latch while the servos still hold them, instead of
+  re-reading the sagged encoders on every repeat (which walked the arm down
+  9 cm in 8 s in simulation); a joint whose servo no longer holds them (a reset)
+  is chosen again from what it holds. Each goal is the one the servo's own
+  Goal_Position register reports, when the joint reads within 100 ticks of it,
+  not its sag. An arm sagging more than 100 ticks drops by its sag once, on the
+  first stop.
+- **Moves plan from the servo's Goal_Position register**, not from a copy of
+  the last goal sent: after a brown-out reset a goal, the stale copy made the
+  first setpoint an unpaced jump back (1.5 m/s at the tip in simulation).
 - **`arm.reach_point`** refuses targets less than the margin inside the
   workspace (`out_of_workspace`; it checked reach only and steered to
   z = -101.7 mm), takes only checked, paced steps, runs under the bus lock and
@@ -63,7 +68,14 @@ nothing bounded speed.
   `joint_positions`, `speed` and `timeout_s`; the bare `move_to` alias is parsed
   like `arm.move_to`.
 - A manifest whose geometry cannot be read refuses motion
-  (`manifest_unreadable`) instead of leaving every check resolving to nothing.
+  (`manifest_unreadable`) instead of leaving every check resolving to nothing:
+  a path that cannot be read, no YAML frontmatter, frontmatter that does not
+  parse (one stray tab) or is not a mapping. Asked on every motion, so a
+  manifest that changes under a running gateway is caught too. Reads still
+  answer.
+- `arm.reach` (a pose derived from the taught one) no longer gets the taught
+  pose's allowance for sitting inside the margin. A refused `arm.reach_point`
+  step no longer says "Nothing was moved." when earlier steps did move.
 - A joint parked outside its configured range can be moved back in; every
   setpoint is converted before the first is sent.
 - The serial handle is dropped under the bus lock, and the stop's latch is built
