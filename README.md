@@ -145,6 +145,8 @@ same thing as a sentence, and may be reworded:
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
 | `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
 | `too_slow` | `speed` so small the move would take longer than 60 s |
+| `busy` | another command is running; commands are refused, not queued |
+| `manifest_unreadable` | the manifest's geometry could not be read, so nothing can be checked |
 | `unreachable` | the links do not span it with the tool vertical |
 | `joint_limits` | solvable, but outside a joint's declared `limits_deg` |
 | `frame_disagreement` | the solve and forward kinematics disagree about where the pose puts the tip |
@@ -250,52 +252,81 @@ goal, and that line is checked and paced before anything is sent.
 
 **The whole path is checked, not its ends.** The line is sampled every
 0.005 rad (about 2 mm at full reach), and the elbow, the wrist and the tip are
-checked against `physics.workspace.bounds_mm` at every sample, twice: as
-commanded, and as the arm will really be (the commanded pose plus the offset
-the arm shows now: gravity sag, friction). Each must stay
-`SO_ARM101_WORKSPACE_MARGIN_MM` (default **10 mm**) inside the box. That margin
+checked against `physics.workspace.bounds_mm` at every sample, face by face,
+twice: as commanded, and as the arm will really be (the commanded pose plus the
+offset the arm shows now: gravity sag, friction). Each must stay
+`SO_ARM101_WORKSPACE_MARGIN_MM` (default **10 mm**) from every face. That margin
 covers what neither series can see: the offset changing with the pose (bob's
 shoulder settles 2.5 to 27 encoder ticks past its goal depending on which way it
-arrived, several millimetres at the tip), servo lag and tick rounding. A move
-that starts inside the margin may not come any closer to the face, unless it
-ends a full margin inside, in which case it may dip up to 5 mm on the way: down
-to the face and no further if it started inside the box, and that much further
-out only if the arm was already outside. That keeps an arm that was pushed out,
-or parked badly, recoverable with `arm.home`, without letting anything walk it
-further out. A refusal is `path_leaves_workspace` with no motion.
+arrived, several millimetres at the tip), servo lag and tick rounding.
 
-The margin has a cost: no target closer than 10 mm to a face is accepted. An
-operator whose work needs the tool nearer the table can declare the face where
+Starting closer than the margin, a point may come no closer to that face, unless
+the move takes it a full margin away, in which case it keeps half the margin
+on the way (or, starting closer than that, may come 1 mm closer than it started,
+never past the face: the first millimetre of almost any line out of a pose
+points the tip a little the wrong way). An arm already past a face (pushed
+out, or parked badly) may go up to 2 mm further past that face, and no other,
+on a move that ends a full margin inside. A pose the operator taught (`arm.home`,
+`arm.reach`) may sit inside the margin; the path to it may come as close as the
+pose itself, or half the margin, and the pose itself must be inside the box. A
+refusal is `path_leaves_workspace` with no motion.
+
+The margin has a cost: no target closer than 10 mm to a face is accepted, as
+commanded or as predicted. The prediction carries today's offset unchanged to
+the goal, and the real offset depends on the pose and on which way the arm
+arrives, so it can be wrong in either direction; the margin is there for the
+direction that matters. In EV-03's simulation (bob's sag model) it erred the
+safe way at the low stations of a tabletop task: carried down from the station
+30 mm above, the offset put the tip 3 mm above the table at a station commanded
+10 mm up, where the simulated arm settles 10.3 mm up, so those stations were
+refused at a 10 mm margin and at a 5 mm one. And bob's taught ready pose sits
+7.6 mm from the x = 340 face (1.6 mm as predicted), where many lines out of it
+start by swinging the tip 1 to 3 mm toward that face, so from ready some
+targets are refused until a move that swings the other way gets the arm out.
+An operator whose work needs the tool nearer a face can declare the face where
 the tool may really go, or lower the margin after measuring their own arm's
 offsets.
 
 **Speed is bounded.** The servos take Goal_Position and nothing else, so a
 speed limit is a stream of setpoints, at most 20 ms apart, sized so that
 neither the tool point nor any joint is asked to move faster than the declared
-limits: `safety.max_linear_velocity_ms` for the tool (the schema's linear speed
-limit, read as the tool point's on this arm; **0.25 m/s** when the manifest
-declares none, ISO 10218-1's reduced speed) and `safety.max_joint_velocity_dps`
-for each joint. The stream is planned at 80 % of the limit. `speed` scales both.
+limits: `safety.max_tool_velocity_ms` for the tool point (**0.25 m/s** when the
+manifest declares none, ISO 10218-1's reduced speed; the schema's
+`max_linear_velocity_ms`, documented for wheeled bases, can only lower it) and
+`safety.max_joint_velocity_dps` for each joint (**90 deg/s** when undeclared, so
+wrist_roll and the gripper, which do not move the tool point, are paced too).
+The stream is planned at 80 % of the limits, and each setpoint goes out at least
+one period after the last: after a stall the move takes longer, it never
+catches up. `speed` scales both limits.
 `speed` 1.0 (the default) used to mean one direct command, which ran the servos
 at their own top speed (270 deg/s and 1.6 m/s at the tip in EV-03's simulation);
 it now means "as fast as the manifest allows".
 
-**Moves start from the goal being held.** A joint within 40 encoder ticks of the
-goal it was last sent (or, on a fresh gateway, of its own Goal_Position
+**Moves start from the goal being held.** A joint within 100 encoder ticks of
+the goal it was last sent (or, on a fresh gateway, of its own Goal_Position
 register) is holding that goal, and the move starts there; planning from the
-sagged reading instead lowers the arm by its sag on every command.
+sagged reading instead lowers the arm by its sag on every command. 100 ticks is
+almost four times bob's measured sag, room for a payload. A joint that starts
+outside its configured range may pass between that start and the range on its
+way back in; every setpoint is converted before the first is sent.
 
 **The stop interrupts, and holds without walking the arm down.** `arm.estop`
 latches before it waits for the bus, and a paced move checks the latch before
-every setpoint, so a move in progress ends within one period. The hold picks
-each joint's goal once per latch (the goal it is holding, or where it is when it
-is not holding one) and a repeated stop re-sends the same goals. The stop used
-to re-read the encoders every time, and under gravity every repeat lowered the
-arm by its sag: 9 cm in 8 s of stops 0.2 s apart in simulation.
+every setpoint, so a move in progress ends within one period. Every other
+request waits at most 1 s for the bus and is then refused as `busy`: commands
+are not queued behind a running move, and a queue of them could otherwise take
+every gateway worker thread and leave the stop without one. The hold picks each
+joint's goal once per latch (the goal it is holding, or where it is when it is
+not holding one) and a repeated stop re-sends the same goals, unless a joint is
+no longer anywhere near its held goal (a power cycle reset it and the arm
+dropped), in which case that joint is held where it is. The stop used to re-read
+the encoders every time, and under gravity every repeat lowered the arm by its
+sag: 9 cm in 8 s of stops 0.2 s apart in simulation.
 
 **`arm.reach_point` respects the workspace.** Targets less than the margin
 inside the box are refused (`out_of_workspace`), and every step it takes is a
-checked, paced move. It used to check reach only, and steered the tip to
+checked, paced move; a step the check refuses ends the call as a signed refusal
+that says how far it got. It used to check reach only, and steered the tip to
 z = -101.7 mm. It now runs under the bus lock and opens the port like every
 other motion; its first call on a fresh gateway used to be an HTTP 500.
 
@@ -308,7 +339,14 @@ neither evicts a process that opened the port first.
 
 Refusals of joint moves are now decisions, not faults: an unknown joint or a
 value outside a joint's limits comes back as a signed `403`
-(`unknown_joint`, `joint_limits`) rather than a `500`.
+(`unknown_joint`, `joint_limits`) rather than a `500`. A manifest whose geometry
+cannot be read refuses every motion (`manifest_unreadable`) instead of letting
+it through unchecked.
+
+**Not covered:** the castor-hal `Transport` path (`transport.py`,
+`make_hal_actuator`) still drives the raw `move()`: unpaced, unchecked and
+outside the bus lock. It is not the entry point the gateway uses; switching to
+it would bypass everything above.
 
 ## What this is
 

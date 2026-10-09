@@ -58,8 +58,8 @@ PACE_FRACTION = 0.8
 #: for a slow move, so it needs a ceiling or it is a hang that holds the bus.
 MAX_MOVE_S = 60.0
 
-#: Joint speed limit used only when the manifest declares no kinematic chain
-#: (so the tool's speed cannot be computed) and no joint limit either.
+#: Joint speed limit used only when no limit at all reaches the planner
+#: (kinematics.declared_speed_limits always supplies one).
 FALLBACK_JOINT_DPS = 60.0
 
 
@@ -103,36 +103,61 @@ def _lerp(start: dict[str, float], goal: dict[str, float], s: float) -> dict[str
     return {j: start[j] + (goal[j] - start[j]) * s for j in goal}
 
 
-#: How much closer to a face than it started a move that begins inside the
-#: margin (or outside the box) may come on its way, provided it ENDS at least the
-#: margin inside. Without it, an arm resting near or past a face could not
-#: leave: the first few millimetres of almost any joint-space line out of a pose
-#: move the tip a little the wrong way. A move that starts inside the box may use
-#: it only down to the face itself, never past it; only an arm that is already
-#: outside may go up to this much further out on its way back in. Because the
-#: move must end fully inside, the allowance cannot be chained into a creep: the
-#: next move starts with the whole margin and is held to it.
-RECOVERY_DIP_MM = 5.0
+#: How much further past a face an arm that is ALREADY past it may go on its way
+#: back in, provided the move ends at least the margin inside that face. Without
+#: it, an arm parked or pushed just outside could not leave: the first
+#: millimetres of almost any joint-space line out of a pose move the tip a
+#: little the wrong way. It applies only to the face the arm is past (clearance
+#: is kept per face), and because the move must end a full margin inside, it
+#: cannot be chained into a creep.
+RECOVERY_DIP_MM = 2.0
+
+#: How much closer to a face a point inside the margin band may come at the very
+#: start of a move that takes it out of the band, on top of the rule below. The
+#: first fraction of a millimetre of almost any joint-space line out of a pose
+#: points the tip a little the wrong way; without this, an arm taught or parked
+#: 1.6 mm from a face (bob's ready pose once it sags) could not leave it at all.
+#: It never reaches past the face.
+START_DIP_MM = 1.0
+
+
+def _floor(first: float, last: float, margin_mm: float) -> float:
+    """The least clearance a point may have on one face during one move.
+
+    A point that starts a full margin inside keeps the whole margin. A point
+    that starts inside the margin band may come no closer than it started,
+    unless the move takes it out of the band (ends a full margin inside), in
+    which case it keeps half the margin, or, starting closer than that, may come
+    START_DIP_MM closer than it started and never past the face: the margin is
+    there for model error the plan cannot see, so a move that leaves the band
+    still keeps what it can of it. A point already past the face may go
+    RECOVERY_DIP_MM further only on a move that ends a full margin inside.
+    """
+    if first >= margin_mm:
+        return margin_mm
+    if last < margin_mm:
+        return first                                # staying in the band: never closer
+    if first >= 0.0:                                # leaving the band
+        return min(margin_mm / 2.0, max(0.0, first - START_DIP_MM))
+    return first - RECOVERY_DIP_MM                  # coming back in from outside
 
 
 def check_line(chain: Chain, box: Box | None, start: dict[str, float], goal: dict[str, float], *,
-               offset: dict[str, float], margin_mm: float, samples: int
+               offset: dict[str, float], margin_mm: float, samples: int, taught_goal: bool = False
                ) -> tuple[float | None, dict | None]:
     """Refuse the line if any checked point gets too close to, or past, a face.
 
     Each point (tip, wrist, elbow) is checked on two series: as COMMANDED (the
     line itself) and as PREDICTED (the line plus ``offset``, the difference
     between where the arm is and where it is being held, which is gravity sag
-    and friction and does not go away while it moves).
+    and friction and does not go away while it moves). Clearance is kept per
+    face of the box, and each face is held to :func:`_floor`.
 
-    A point that starts at least ``margin_mm`` inside the box must stay at
-    least that far inside along the whole line. A point that starts closer (or
-    outside the box: an arm pushed out, or parked badly) may not come any
-    closer than it started, unless the move ends with it at least the margin
-    inside, in which case it may dip by up to RECOVERY_DIP_MM on the way: down
-    to the face and no further if it started inside the box, and that much
-    further out if it started outside. That keeps an arm near or past a face
-    recoverable (arm.home) without letting anything walk it further out.
+    ``taught_goal`` is for a pose the operator taught (arm.home, arm.reach): it
+    may sit inside the margin, as bob's ready pose does (7.6 mm from x = 340), so
+    on a face the goal is that close to, the path may come as close as the goal
+    itself or half the margin, whichever is closer, and no closer than that. The
+    goal must be inside the box as commanded.
 
     Returns the closest clearance seen and where. Raises DeniedError
     ``path_leaves_workspace`` naming the first sample that fails.
@@ -142,7 +167,7 @@ def check_line(chain: Chain, box: Box | None, start: dict[str, float], goal: dic
     series = {"commanded": None}
     if any(abs(v) > 0.0 for v in offset.values()):
         series["predicted"] = offset
-    clear: dict[tuple[str, str], list[float]] = {}
+    clear: dict[tuple[str, str], list[tuple[float, ...]]] = {}
     where: dict[tuple[str, str], list[tuple[float, float, float]]] = {}
     for i in range(samples + 1):
         q = _lerp(start, goal, i / samples)
@@ -150,34 +175,46 @@ def check_line(chain: Chain, box: Box | None, start: dict[str, float], goal: dic
             pose = q if off is None else {j: v + off.get(j, 0.0) for j, v in q.items()}
             points = chain.points(pose)
             for name in CHECKED_POINTS:
-                clear.setdefault((kind, name), []).append(box.clearance(points[name]))
+                clear.setdefault((kind, name), []).append(box.clearances(points[name]))
                 where.setdefault((kind, name), []).append(points[name])
 
-    closest_c, closest = math.inf, None
-    for (kind, name), values in clear.items():
-        first, last = values[0], values[-1]
-        if first >= margin_mm:
-            floor = margin_mm                           # keep the whole margin
-        elif last >= margin_mm and first >= 0.0:
-            floor = max(0.0, first - RECOVERY_DIP_MM)   # leaving the band: never past the face
-        elif last >= margin_mm:
-            floor = first - RECOVERY_DIP_MM             # coming back in from outside
-        else:
-            floor = first                               # staying in the band: never closer
-        for i, c in enumerate(values):
-            point = where[(kind, name)][i]
-            if c < closest_c:
-                closest_c = c
-                closest = {"point": name, "series": kind, "fraction_of_path": round(i / samples, 3),
-                           "face": box.nearest_face(point), "at_mm": [round(v, 1) for v in point]}
-            if c < margin_mm and c < floor - 1e-6:
+    if taught_goal:
+        for name in CHECKED_POINTS:
+            last = clear[("commanded", name)][-1]
+            if min(last) < 0.0:
+                face = min(range(len(last)), key=last.__getitem__)
                 raise DeniedError(
                     "path_leaves_workspace",
-                    f"the {name}, {kind}, would come {c:.1f} mm from the workspace face "
-                    f"{box.nearest_face(point)} at {i / samples:.0%} of the way (the margin is "
-                    f"{margin_mm:g} mm; the move starts {first:.1f} mm and ends {last:.1f} mm "
-                    f"inside). The ends of a move can both be inside the box while the path "
-                    f"between them is not. Nothing was moved.")
+                    f"the taught pose puts the {name} {-last[face]:.1f} mm past the workspace face "
+                    f"{box.face_name(face)}. Re-teach the pose or widen "
+                    f"physics.workspace.bounds_mm. Nothing was moved.")
+
+    closest_c, closest = math.inf, None
+    for (kind, name), rows in clear.items():
+        for face in range(len(rows[0])):
+            first, last = rows[0][face], rows[-1][face]
+            floor = _floor(first, last, margin_mm)
+            if taught_goal and last < margin_mm:
+                # A taught pose inside the margin: the path may come as close
+                # as the pose itself, or to half the margin, less the start-up
+                # allowance for the approach, and never past the face.
+                floor = min(floor, max(0.0, min(last, margin_mm / 2.0) - START_DIP_MM))
+            for i, rowc in enumerate(rows):
+                c = rowc[face]
+                if c < closest_c:
+                    closest_c = c
+                    closest = {"point": name, "series": kind, "fraction_of_path": round(i / samples, 3),
+                               "face": box.face_name(face),
+                               "at_mm": [round(v, 1) for v in where[(kind, name)][i]]}
+                if c < floor - 1e-6:
+                    raise DeniedError(
+                        "path_leaves_workspace",
+                        f"the {name}, {kind}, would come {c:.1f} mm from the workspace face "
+                        f"{box.face_name(face)} at {i / samples:.0%} of the way, closer than the "
+                        f"{floor:.1f} mm this move may come (the margin is {margin_mm:g} mm; the "
+                        f"move starts {first:.1f} mm and ends {last:.1f} mm from that face). "
+                        f"The ends of a move can both be inside the box while the path between "
+                        f"them is not. Nothing was moved.")
     return (None if math.isinf(closest_c) else round(closest_c, 2)), closest
 
 
@@ -195,9 +232,11 @@ def pace_line(chain: Chain, start: dict[str, float], goal: dict[str, float], *, 
     """
     span = max((abs(goal[j] - start[j]) for j in goal), default=0.0)
     tool_rate = tool_mps * 1000.0 * speed * fraction          # mm/s
-    joint_rate = math.radians(joint_dps) * speed * fraction if joint_dps else None  # rad/s
-    if not (tool_rate > 0.0 and math.isfinite(tool_rate)) or (
-            joint_rate is not None and not (joint_rate > 0.0 and math.isfinite(joint_rate))):
+    # Always a joint limit: joints that do not move the tool point (wrist_roll,
+    # the gripper) would otherwise be one command at the servo's top speed.
+    joint_rate = math.radians(joint_dps or FALLBACK_JOINT_DPS) * speed * fraction  # rad/s
+    if not (tool_rate > 0.0 and math.isfinite(tool_rate)) or not (
+            joint_rate > 0.0 and math.isfinite(joint_rate)):
         raise DeniedError("too_slow", f"speed {speed!r} is too small to plan a move with")
     if span == 0.0:
         return [dict(goal)], 0.0, 0.0, 0.0
@@ -209,9 +248,7 @@ def pace_line(chain: Chain, start: dict[str, float], goal: dict[str, float], *, 
         tip = chain.points(_lerp(start, goal, i / samples))["tip"]
         stretch = math.dist(tip, last_tip)
         path += stretch
-        dt = stretch / tool_rate
-        if joint_rate is not None:
-            dt = max(dt, joint_step / joint_rate)
+        dt = max(stretch / tool_rate, joint_step / joint_rate)
         times.append(times[-1] + dt)
         last_tip = tip
     duration = times[-1]
@@ -240,7 +277,7 @@ def pace_line(chain: Chain, start: dict[str, float], goal: dict[str, float], *, 
 
 def plan(chain: Chain | None, box: Box | None, start: dict[str, float], goal: dict[str, float], *,
          offset: dict[str, float], margin_mm: float, speed: float, limits: dict,
-         check_path: bool = True) -> Plan:
+         check_path: bool = True, taught_goal: bool = False) -> Plan:
     """Check and pace the joint-space line from ``start`` to ``goal``.
 
     ``start``, ``goal`` and ``offset`` are radians keyed by joint, over the same
@@ -274,7 +311,8 @@ def plan(chain: Chain | None, box: Box | None, start: dict[str, float], goal: di
                     ["no kinematic chain: paced by joint speed only"])
     if check_path:
         min_clear, closest = check_line(chain, box, start, goal, offset=offset,
-                                        margin_mm=margin_mm, samples=samples)
+                                        margin_mm=margin_mm, samples=samples,
+                                        taught_goal=taught_goal)
     else:
         min_clear, closest = None, None
         notes.append("path not checked")

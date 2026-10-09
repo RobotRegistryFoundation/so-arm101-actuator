@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
 import threading
 import time
@@ -37,16 +38,30 @@ DEFAULT_SPEED = 1.0
 #: and tick rounding. Override with SO_ARM101_WORKSPACE_MARGIN_MM.
 WORKSPACE_MARGIN_MM = 10.0
 
-#: A joint within this many encoder ticks of the goal this actuator last sent it
-#: is HOLDING that goal; the difference is gravity sag and friction (bob: up to
-#: 27 ticks past the goal when lifted into place). Moves are planned from that
-#: goal, and a stop re-sends it. Planning from, or holding at, the READING instead
-#: lowers the goal by the sag every time: the "sag ratchet" that took a gate out
-#: of its envelope in under six seconds on bob, and that walked this arm down
-#: 9 cm in 8 s under repeated stops. Further away than this, the joint is not
-#: where it was left (moving, pushed, or another process drove it), and the
-#: reading is the only honest start.
-ADOPT_REFERENCE_TICKS = 40
+#: A joint within this many encoder ticks of the goal it was last sent is
+#: HOLDING that goal; the difference is gravity sag and friction. Moves are
+#: planned from that goal, and a stop re-sends it. Planning from, or holding at,
+#: the READING instead lowers the goal by the sag every time: the "sag ratchet"
+#: that took a gate out of its envelope in under six seconds on bob, and that
+#: walked this arm down 9 cm in 8 s under repeated stops. Bob's measured sag is
+#: up to 27 ticks unloaded; 100 (8.8 degrees) leaves room for a payload that
+#: triples it. Adopting the goal adds no motion of its own (the servo is already
+#: driving to it), so the bound only has to separate holding from a joint that
+#: was moved a long way by something else (a power cycle that reset the goal, a
+#: collapse), where the reading is the only honest start.
+ADOPT_REFERENCE_TICKS = 100
+
+#: How long a request waits for the servo bus before it is refused as busy. A
+#: paced move holds the bus for its whole stream, and every request queued
+#: behind it holds one of the gateway's worker threads; with no bound, a burst
+#: of polls took every thread and the stop could not get one to latch on (a
+#: 25 s move ran to the end with a stop sent at 5 s). Commands are refused, not
+#: queued, while the arm is busy.
+BUS_WAIT_S = 1.0
+
+#: How long the stop waits for the bus to hold the arm once it has latched. A
+#: paced move sees the latch and lets go within one pace period.
+STOP_BUS_WAIT_S = 5.0
 
 #: The joints the kinematic chain walks; the gripper is not one of them.
 ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
@@ -204,6 +219,24 @@ def _release_serial(handle) -> None:  # noqa: ANN001 — a serial.Serial or None
 #: (reproduced 6/6). Mutual exclusion has to live here, at the device owner —
 #: rate-limiting one client cannot help when a second client exists.
 _BUS_LOCK = threading.Lock()
+
+#: Guards the lazy construction of the stop's latch (``_estop_transport``): two
+#: requests building it at once could latch one copy and consult the other.
+_TRANSPORT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _bus(timeout_s: float):
+    """Hold the servo bus, or refuse as busy after ``timeout_s``."""
+    if not _BUS_LOCK.acquire(timeout=timeout_s):
+        raise DeniedError(
+            "busy",
+            "the arm is carrying out another command, and commands are refused rather than "
+            "queued while it does. Try again when it has finished.")
+    try:
+        yield
+    finally:
+        _BUS_LOCK.release()
 
 #: ROBOT.md capability names this driver can actually execute. Declared-but-
 #: unimplemented capabilities (arm.pick / arm.place need the vision rig and a
@@ -418,6 +451,8 @@ class SOArm101Actuator:
         #: The ticks a latched stop is holding, chosen once per latch so that a
         #: repeated stop re-sends them instead of re-reading a sagged pose.
         self._held: dict[str, int] | None = None
+        #: (manifest path, why) when that manifest's geometry could not be read.
+        self._manifest_error: tuple[str, str] | None = None
 
     @classmethod
     def from_default_port(cls, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> "SOArm101Actuator":
@@ -588,7 +623,8 @@ class SOArm101Actuator:
             return None
 
     def _move_checked(self, joint_positions: dict[str, float], *, speed: float = DEFAULT_SPEED,
-                      timeout_s: float = 5.0, hold: tuple[str, ...] = ()) -> dict:
+                      timeout_s: float = 5.0, hold: tuple[str, ...] = (),
+                      taught_goal: bool = False) -> dict:
         """Move these joints along a checked, paced line, then wait for arrival.
 
         The path from the pose the arm is being held at to the goal is checked
@@ -599,6 +635,14 @@ class SOArm101Actuator:
         are still counts toward the path check. Joints in ``hold`` are
         commanded to stay where the move starts (their reference, or their
         reading when they are not holding one) and are reported like the rest.
+
+        ``taught_goal`` is for a pose the operator taught (arm.home, arm.reach),
+        which may sit inside the workspace margin; see :func:`motion.check_line`.
+
+        Every setpoint is converted to ticks before the first one is sent, so a
+        conversion that fails cannot leave a move half-written. A joint that
+        starts outside its configured range may pass through values between
+        that start and the range on its way back in, and nowhere else.
 
         The stream stops between setpoints if the software stop latches, and
         the result says so.
@@ -620,26 +664,47 @@ class SOArm101Actuator:
         goal = {**start, **{j: float(v) for j, v in joint_positions.items()}}
         plan = motion.plan(self._chain(), kin.workspace_box(manifest), start, goal,
                            offset=offset, margin_mm=resolve_workspace_margin_mm(), speed=speed,
-                           limits=kin.declared_speed_limits(manifest))
+                           limits=kin.declared_speed_limits(manifest), taught_goal=taught_goal)
 
         commanded = {**{j: start[j] for j in hold}, **{j: goal[j] for j in joint_positions}}
+        ticks_plan = [[(j, self._ticks_on_path(j, setpoint[j], start[j])) for j in commanded]
+                      for setpoint in plan.setpoints]
         started = time.monotonic()
-        completed = self._stream(plan, list(commanded))
+        completed = self._stream(ticks_plan, plan.step_s)
         result = self._await_arrival(commanded, started=started, timeout_s=timeout_s,
                                      interrupted=not completed)
         result["motion"] = self._motion_telemetry(plan, offset, completed)
         return result
 
-    def _stream(self, plan: motion.Plan, joints: list[str]) -> bool:
-        """Send the plan's setpoints for ``joints``, one step apart. False if the
-        software stop latched before the last one went out."""
-        t0 = time.monotonic()
-        for k, setpoint in enumerate(plan.setpoints, start=1):
+    @staticmethod
+    def _ticks_on_path(joint: str, rad: float, start_rad: float) -> int:
+        """Ticks for a setpoint on a checked line. Inside the joint's configured
+        range, or between an out-of-range start and that range; nowhere else."""
+        spec = config.JOINTS[joint]
+        low, high = min(spec["min_rad"], start_rad), max(spec["max_rad"], start_rad)
+        if not (low - 1e-9 <= rad <= high + 1e-9):
+            raise OutOfRangeError(
+                f"{joint}={rad:.3f} outside [{spec['min_rad']}, {spec['max_rad']}]")
+        ticks = int(round(spec["tick_at_zero_rad"] + rad * spec["ticks_per_rad"]))
+        return max(0, min(4095, ticks))
+
+    def _stream(self, ticks_plan: list[list[tuple[str, int]]], step_s: float) -> bool:
+        """Send each setpoint at least ``step_s`` after the one before. False if
+        the software stop latched before the last one went out.
+
+        Paced from the previous write, never against a schedule: after a stall
+        (a servo that misses a status packet costs a 0.1 s read timeout) a
+        schedule sends the overdue setpoints back to back, which ran the tool at
+        0.55 m/s against a 0.25 m/s limit. Late setpoints make the move longer,
+        never faster.
+        """
+        for setpoint in ticks_plan:
             if self._latched():
                 return False
-            for joint in joints:
-                self._write_goal(joint, config.rad_to_ticks(joint, setpoint[joint]))
-            wait = t0 + k * plan.step_s - time.monotonic()
+            sent = time.monotonic()
+            for joint, ticks in setpoint:
+                self._write_goal(joint, ticks)
+            wait = sent + step_s - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
         return True
@@ -699,6 +764,15 @@ class SOArm101Actuator:
                 present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
                 held[joint] = self._holding_ticks(joint, present)
             self._held = held
+        else:
+            # A held goal is re-sent only while the joint is still holding it.
+            # A joint now far from it (a power cycle reset its goal and the arm
+            # dropped) is held where it is: re-sending the old goal would drive
+            # it back at the servo's top speed (2.4 m/s at the tip, in sim).
+            for joint, spec in config.JOINTS.items():
+                present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
+                if abs(present - self._held[joint]) > ADOPT_REFERENCE_TICKS:
+                    self._held[joint] = present
         for joint, ticks in self._held.items():
             self._write_goal(joint, ticks)
         return dict(self._held)
@@ -723,8 +797,12 @@ class SOArm101Actuator:
                 pose = {**pose, **self._home_pose_override}
             self.home_pose_rad = pose
             self._manifest_applied = key
-        except Exception:
-            pass
+            self._manifest_error = None
+        except Exception as exc:  # noqa: BLE001 — recorded; motion refuses on it (see execute)
+            # Not fatal for reads. For motion it is: with the geometry unread the
+            # workspace, the chain and the limits resolve to nothing, and every
+            # move would go unchecked.
+            self._manifest_error = (key, f"{type(exc).__name__}: {exc}")
 
     def reach_point(self, target_mm, *, tolerance_mm: float = 5.0,
                     max_iterations: int = 25) -> dict:
@@ -764,12 +842,18 @@ class SOArm101Actuator:
                 f"{list(target)} is {box.clearance(target):.1f} mm inside the declared workspace "
                 f"(face {box.nearest_face(target)}); a target must be at least {margin:g} mm inside.")
 
+        refused: dict[str, str] = {}
+
         def _step(pose: dict[str, float]) -> str | None:
             """One checked, paced move. Returns why it could not be made, or None."""
             try:
                 result = self._move_checked(pose, timeout_s=3.0)
             except DeniedError as exc:
+                refused.setdefault("code", exc.code)
                 return f"the next step was refused: {exc.detail}"
+            except OutOfRangeError as exc:
+                refused.setdefault("code", "joint_limits")
+                return f"the next step was refused: {exc}"
             if result["motion"]["stopped_by_estop"] or self._latched():
                 return "stopped by arm.estop"
             return None
@@ -814,6 +898,8 @@ class SOArm101Actuator:
             if why is None:
                 self._settle(safe)
                 warm_started = True
+            else:
+                refused.clear()   # a warm start that is refused is simply not taken
 
         # Static-error compensation. These servos hold a static error under
         # load (measured 2026-09-09: shoulder_lift sits 0.03-0.04 rad from where
@@ -842,10 +928,13 @@ class SOArm101Actuator:
                     self._settle(back)
                 current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
                 error = kin.reach_step(current, target, manifest_path=self._manifest_applied)[1]
-            return {"arrived": False, "error_mm": round(error, 2),
-                    "iterations": step, "error_history": history,
-                    "warm_started": warm_started, "stopped_because": why,
-                    "final_positions": current}
+            out = {"arrived": False, "error_mm": round(error, 2),
+                   "iterations": step, "error_history": history,
+                   "warm_started": warm_started, "stopped_because": why,
+                   "final_positions": current}
+            if why.startswith("the next step was refused") and "code" in refused:
+                out["refused"] = refused["code"]
+            return out
 
         for step in range(max_iterations):
             current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
@@ -1144,7 +1233,7 @@ class SOArm101Actuator:
         time.sleep(min_dwell_s)
         deadline = time.monotonic() + max_wait_s
         last = {j: self._read_joint(j) for j in commanded}
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self._latched():
             time.sleep(poll_s)
             now = {j: self._read_joint(j) for j in commanded}
             on_target = all(abs(now[j] - commanded[j]) <= still_rad for j in commanded)
@@ -1169,10 +1258,13 @@ class SOArm101Actuator:
         """
         transport = getattr(self, "_transport", None)
         if transport is None:
-            from so_arm101_actuator.transport import SOArm101Transport
+            with _TRANSPORT_LOCK:
+                transport = getattr(self, "_transport", None)
+                if transport is None:
+                    from so_arm101_actuator.transport import SOArm101Transport
 
-            transport = SOArm101Transport(actuator=self, port=port, baud=baud)
-            self._transport = transport
+                    transport = SOArm101Transport(actuator=self, port=port, baud=baud)
+                    self._transport = transport
         return transport
 
     def execute(
@@ -1247,7 +1339,8 @@ class SOArm101Actuator:
             try:
                 # Same lock every move takes: the hold writes a setpoint per
                 # joint, and a read interleaved into that sequence corrupts both.
-                with _BUS_LOCK:
+                # A move in progress lets go within one pace period of the latch.
+                with _bus(STOP_BUS_WAIT_S):
                     transport.estop()
                     held = {joint: _config_module.ticks_to_rad(joint, ticks)
                             for joint, ticks in (self._held or {}).items()}
@@ -1274,7 +1367,13 @@ class SOArm101Actuator:
             )
         if tool_name == "arm.estop.clear":
             transport = self._estop_transport(port=port, baud=baud)
-            transport.clear_estop()
+            try:
+                # Under the bus lock, so a clear cannot interleave with a stop
+                # that is still choosing what to hold.
+                with _bus(STOP_BUS_WAIT_S):
+                    transport.clear_estop()
+            except DeniedError as exc:
+                return _denied(exc)
             return ActuatorOutcome(
                 success=True,
                 outcome_kind="executed",
@@ -1294,13 +1393,23 @@ class SOArm101Actuator:
                     f"arm is e-stopped; {tool_name!r} is refused until "
                     "arm.estop.clear is invoked at the commission tier",
                 ))
+            # Fail closed on geometry. A manifest whose geometry could not be
+            # read leaves the workspace, the chain and the limits resolving to
+            # nothing, and the move would go unchecked.
+            key = str(manifest_path) if manifest_path else ""
+            if key and self._manifest_error is not None and self._manifest_error[0] == key:
+                return _denied(DeniedError(
+                    "manifest_unreadable",
+                    f"this robot's geometry could not be read from {key} "
+                    f"({self._manifest_error[1]}), so no motion can be checked against it"))
 
         # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
         # stay unmapped: they need the vision rig, and the gateway deny-lists
         # them via ROBOT_MD_TOOL_ALLOWLIST so clients get a signed DENY instead.
+        taught = False
         if tool_name in ("arm.home", "home"):
             pose = self._home_pose_for_motion()
-            tool_name, tool_args = "move", {"joint_positions": pose}
+            tool_name, tool_args, taught = "move", {"joint_positions": pose}, True
         elif tool_name == "arm.reach_point":
             target = tool_args.get("target_mm")
             if (not isinstance(target, (list, tuple)) or len(target) != 3
@@ -1312,25 +1421,40 @@ class SOArm101Actuator:
                     or not math.isfinite(tolerance) or tolerance <= 0):
                 return _denied(DeniedError(
                     "bad_args", f"tolerance_mm must be a positive number, got {tolerance!r}"))
+            # The warm-start table is arithmetic (seconds of it on a Pi, the
+            # first time). Build it before taking the bus, not while holding it.
+            try:
+                kin._safe_table(self._manifest_applied, config.SAFE_RANGE_RAD)
+            except Exception:  # noqa: BLE001 — reach_point falls back to a cold start
+                pass
             try:
                 # The same lock and lazy open as every other motion. reach_point
                 # used to run outside both: on a fresh gateway (no protocol open
                 # yet) it failed with a 500, and it could interleave its bus
                 # traffic with another request's.
-                with _BUS_LOCK:
-                    self._ensure_protocol(port=port, baud=baud)
-                    telemetry = self.reach_point(target, tolerance_mm=float(tolerance))
+                with _bus(BUS_WAIT_S):
+                    try:
+                        self._ensure_protocol(port=port, baud=baud)
+                        telemetry = self.reach_point(target, tolerance_mm=float(tolerance))
+                    except (OSError, IOError) as exc:
+                        self._drop_protocol()       # under the lock, never beside another request
+                        return ActuatorOutcome(success=False, outcome_kind="error",
+                                               error_message=f"{type(exc).__name__}: {exc}")
             except DeniedError as exc:
                 return _denied(exc)
             except OutOfRangeError as exc:
                 return _denied(DeniedError("unreachable", str(exc)))
-            except (OSError, IOError) as exc:
-                self._drop_protocol()
-                return ActuatorOutcome(success=False, outcome_kind="error",
-                                       error_message=f"{type(exc).__name__}: {exc}")
             except Exception as exc:  # noqa: BLE001 — exceptions become outcomes
                 return ActuatorOutcome(success=False, outcome_kind="error",
                                        error_message=f"{type(exc).__name__}: {exc}")
+            if telemetry.get("refused"):
+                # A step the workspace check refused is a decision, like any
+                # other refusal: a signed 403 that carries how far it got.
+                return ActuatorOutcome(
+                    success=False, outcome_kind="denied",
+                    telemetry={**telemetry, "deny": telemetry["refused"],
+                               "reason": telemetry.get("stopped_because")},
+                    error_message=f"{telemetry['refused']}: {telemetry.get('stopped_because')}")
             return ActuatorOutcome(
                 success=bool(telemetry.get("arrived")),
                 outcome_kind="executed" if telemetry.get("arrived") else "error",
@@ -1340,10 +1464,11 @@ class SOArm101Actuator:
                     f"(final error {telemetry.get('error_mm')} mm, "
                     f"history {telemetry.get('error_history')}, "
                     f"warm_started={telemetry.get('warm_started')})"))
-        elif tool_name == "arm.move_to":
+        elif tool_name in ("arm.move_to", "move_to"):
             # Argument shape is settled BEFORE the bus is opened: a malformed
             # request should not cost a serial handle, and it must come back as
-            # a deny rather than as a driver crash.
+            # a deny rather than as a driver crash. The bare `move_to` alias is
+            # parsed the same way; it used to skip this and take any timeout_s.
             try:
                 tool_args = _parse_move_to_args(tool_args)
             except DeniedError as exc:
@@ -1363,7 +1488,7 @@ class SOArm101Actuator:
                 )
             reach_pose = self._home_pose_for_motion()
             reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
-            tool_name, tool_args = "move", {"joint_positions": reach_pose}
+            tool_name, tool_args, taught = "move", {"joint_positions": reach_pose}, True
         if tool_name == "move":
             # Every joint move the gateway can ask for (arm.home, arm.reach, a
             # bare `move`) is checked against the workspace and paced, exactly
@@ -1379,7 +1504,8 @@ class SOArm101Actuator:
                                 + (f"; not {', '.join(unknown)}" if unknown else "")))
             tool_args = {"joint_positions": joints,
                          "speed": tool_args.get("speed", DEFAULT_SPEED),
-                         "timeout_s": float(timeout)}
+                         "timeout_s": float(timeout),
+                         "taught_goal": taught}
         method = {
             "move": self._move_checked,
             "read_state": self.read_state,
@@ -1395,10 +1521,26 @@ class SOArm101Actuator:
         try:
             # Held across open AND the whole operation: a move polls the bus
             # repeatedly until it converges, and a read slipped in between
-            # those polls corrupts both.
-            with _BUS_LOCK:
-                self._ensure_protocol(port=port, baud=baud)
-                result = method(**tool_args)
+            # those polls corrupts both. Waited for only briefly (BUS_WAIT_S):
+            # a request queued behind a long move holds a gateway thread the
+            # stop may need.
+            with _bus(BUS_WAIT_S):
+                try:
+                    self._ensure_protocol(port=port, baud=baud)
+                    result = method(**tool_args)
+                except (OSError, IOError) as exc:
+                    # The serial handle is held for the process lifetime, so a
+                    # USB replug leaves a dead fd that would fail every later
+                    # invoke. Drop it (and release its exclusive claim) so the
+                    # next invoke re-opens by-id instead of needing a restart,
+                    # and do it while still holding the bus: dropping it after
+                    # letting go closed the handle under the next request.
+                    self._drop_protocol()
+                    return ActuatorOutcome(
+                        success=False,
+                        outcome_kind="error",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
         except DeniedError as exc:
             # A refusal is a decision. It leaves the bus untouched and reaches
             # the caller as a signed 403, not as a 500 that reads like a fault.
@@ -1407,17 +1549,6 @@ class SOArm101Actuator:
             return _denied(DeniedError("unknown_joint", f"no joint named {exc.args[0]!r} on this arm"))
         except OutOfRangeError as exc:
             return _denied(DeniedError("joint_limits", str(exc)))
-        except (OSError, IOError) as exc:
-            # The serial handle is held for the process lifetime, so a USB
-            # replug leaves a dead fd that would fail every later invoke. Drop
-            # it (and release its exclusive claim) so the next invoke re-opens
-            # by-id instead of needing a restart.
-            self._drop_protocol()
-            return ActuatorOutcome(
-                success=False,
-                outcome_kind="error",
-                error_message=f"{type(exc).__name__}: {exc}",
-            )
         except Exception as exc:  # noqa: BLE001 — actuator code is operator-supplied; exceptions become outcomes
             return ActuatorOutcome(
                 success=False,

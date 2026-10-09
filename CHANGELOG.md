@@ -23,22 +23,31 @@ nothing bounded speed.
   pose the arm is held at to the goal along one joint-space line that is
   checked against `physics.workspace.bounds_mm` at the elbow, wrist and tip,
   as commanded and as the arm will really be (commanded + its current offset),
-  with a margin (`SO_ARM101_WORKSPACE_MARGIN_MM`, default 10 mm), and streamed
-  as setpoints at most 20 ms apart under the declared speed limits. New deny
-  codes: `path_leaves_workspace`, `too_slow`. **No target closer than the margin
-  to a face is accepted.**
+  with a margin (`SO_ARM101_WORKSPACE_MARGIN_MM`, default 10 mm) kept per face
+  (a move leaving the band keeps half of it, or comes at most 1 mm closer and
+  never past the face when it starts nearer than that; an arm past a face may go 2 mm
+  further on that face only, on its way back in; a taught pose inside the
+  margin can still be reached), and streamed as setpoints at least 20 ms apart
+  (never catching up after a stall) under the declared speed limits. New deny
+  codes: `path_leaves_workspace`, `too_slow`, `busy`, `manifest_unreadable`.
+  **No target closer than the margin to a face is accepted.**
 - **`speed` means the fraction of the declared limits.** 1.0 (the default) used
   to be one direct Goal_Position command, which ran the servos at their own top
-  speed; it is now the manifest's limits: `safety.max_linear_velocity_ms` for
-  the tool point (0.25 m/s when undeclared) and `safety.max_joint_velocity_dps`
-  per joint. Moves take longer. The `waypoints` telemetry key is now the number
+  speed; it is now the manifest's limits: `safety.max_tool_velocity_ms` for the
+  tool point (0.25 m/s when undeclared; `max_linear_velocity_ms` can only lower
+  it) and `safety.max_joint_velocity_dps` per joint (90 deg/s when undeclared).
+  Moves take longer. The `waypoints` telemetry key is now the number
   of setpoints streamed; a `motion` block reports the pacing, the limits, how
   close the path came to a face and whether a stop ended it.
 - **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
   waits for the bus lock, a paced move checks the latch before every setpoint,
-  and the hold re-sends the goals it chose for this latch instead of re-reading
-  the sagged encoders on every repeat (which walked the arm down 9 cm in 8 s in
-  simulation). It holds the goal a joint is holding, not its sag.
+  and every other request waits at most 1 s for the bus before it is refused as
+  `busy`, so queued requests cannot take every gateway thread from the stop. The
+  hold re-sends the goals it chose for this latch instead of re-reading the
+  sagged encoders on every repeat (which walked the arm down 9 cm in 8 s in
+  simulation), except for a joint that has since moved far from its held goal,
+  which is held where it is. It holds the goal a joint is holding (within 100
+  ticks), not its sag.
 - **`arm.reach_point`** refuses targets less than the margin inside the
   workspace (`out_of_workspace`; it checked reach only and steered to
   z = -101.7 mm), takes only checked, paced steps, runs under the bus lock and
@@ -51,7 +60,22 @@ nothing bounded speed.
   `OverflowError` (an HTTP 500).
 - An unknown joint or a joint value outside its limits is a signed refusal
   (`unknown_joint`, `joint_limits`), not a 500. A bare `move` takes only
-  `joint_positions`, `speed` and `timeout_s`.
+  `joint_positions`, `speed` and `timeout_s`; the bare `move_to` alias is parsed
+  like `arm.move_to`.
+- A manifest whose geometry cannot be read refuses motion
+  (`manifest_unreadable`) instead of leaving every check resolving to nothing.
+- A joint parked outside its configured range can be moved back in; every
+  setpoint is converted before the first is sent.
+- The serial handle is dropped under the bus lock, and the stop's latch is built
+  under its own lock.
+- Not covered: the castor-hal `Transport` path still drives the raw `move()`.
+- The cost, in the same simulation: no excursion in 9 hostile ten-minute runs,
+  but with the declared joint limits a benign tabletop task ran 64 of its 93
+  moves (its stations 10 mm above the table were refused: the predicted series
+  carries the offset from the station above, which over-predicts the sag there
+  by about 7 mm), and a task working 4 to 18 mm above the table ran none from
+  bob's ready pose (it sits in the margin band of x = 340, and each line out of
+  it swung toward that face).
 
 ### Added
 

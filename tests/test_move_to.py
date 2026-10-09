@@ -206,12 +206,12 @@ def test_a_slower_speed_takes_proportionally_longer(monkeypatch):
 
 
 def test_a_manifest_tool_limit_and_joint_limit_both_bound_the_stream(monkeypatch, tmp_path):
-    """`safety.max_linear_velocity_ms` replaces the default tool limit, and
+    """`safety.max_tool_velocity_ms` replaces the default tool limit, and
     `safety.max_joint_velocity_dps` caps every joint as well."""
     monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", WIDE_RANGES)
     text = Path(M).read_text()
     manifest = tmp_path / "ROBOT.md"
-    manifest.write_text(text.replace("\n---", "\nsafety:\n  max_linear_velocity_ms: 0.5\n"
+    manifest.write_text(text.replace("\n---", "\nsafety:\n  max_tool_velocity_ms: 0.5\n"
                                               "  max_joint_velocity_dps: 30\n---", 1))
     proto = MagicMock()
     state: dict[int, int] = {i: 2048 for i in range(1, 7)}
@@ -491,3 +491,13 @@ def test_denied_error_carries_a_code_and_a_detail():
     assert exc.code == "unreachable"
     assert exc.detail == "too far"
     assert str(exc) == "unreachable: too far"
+
+
+@pytest.mark.parametrize("linear, expected", [(0.4, kin.DEFAULT_MAX_TOOL_SPEED_MPS), (0.1, 0.1)])
+def test_a_base_speed_limit_can_lower_the_tool_limit_but_never_raise_it(tmp_path, linear, expected):
+    """`max_linear_velocity_ms` is documented for wheeled bases. On a mobile
+    manipulator it is the base's speed, and must not raise the arm's."""
+    text = Path(M).read_text()
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(text.replace("\n---", f"\nsafety:\n  max_linear_velocity_ms: {linear}\n---", 1))
+    assert kin.declared_speed_limits(str(manifest))["tool_mps"] == pytest.approx(expected)

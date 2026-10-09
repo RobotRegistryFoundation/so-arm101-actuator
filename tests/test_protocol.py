@@ -92,3 +92,32 @@ def test_ping_returns_true_on_response():
     fake = FakeSerial(scripted_reads=[_status_ok(motor_id=2)])
     proto = SCSProtocol(serial=fake)
     assert proto.ping(motor_id=2) is True
+
+
+def test_read_goal_position_reads_the_setpoint_register():
+    """Goal_Position (0x2A) is what the servo is holding; Present_Position
+    (0x38) is where gravity has left it. A fresh gateway plans from the first."""
+    fake = FakeSerial(scripted_reads=[_status_with_data(motor_id=3, data=b"\x10\x08")])
+    proto = SCSProtocol(serial=fake)
+    assert proto.read_goal_position(motor_id=3) == 0x0810
+    assert fake.written == [_build_packet(motor_id=3, instruction=0x02, params=b"\x2a\x02")]
+
+
+@pytest.mark.parametrize("method", ["read_position", "read_goal_position"])
+def test_a_reply_without_the_header_is_a_protocol_error_not_a_position(method):
+    from so_arm101_actuator.errors import ProtocolError
+
+    fake = FakeSerial(scripted_reads=[b"\x00\x00\x02\x04\x00\x00\x08\xf1"])
+    proto = SCSProtocol(serial=fake)
+    with pytest.raises(ProtocolError):
+        getattr(proto, method)(motor_id=2)
+
+
+@pytest.mark.parametrize("method", ["read_position", "read_goal_position"])
+def test_a_short_reply_is_a_protocol_error_not_a_position(method):
+    from so_arm101_actuator.errors import ProtocolError
+
+    fake = FakeSerial(scripted_reads=[b"\xff\xff\x02"])
+    proto = SCSProtocol(serial=fake)
+    with pytest.raises(ProtocolError):
+        getattr(proto, method)(motor_id=2)

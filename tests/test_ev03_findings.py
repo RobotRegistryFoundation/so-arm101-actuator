@@ -84,13 +84,38 @@ def test_but_never_walks_further_out_than_the_recovery_allowance():
         _check([345.0, 345.0 + motion.RECOVERY_DIP_MM + 1.0, 300.0])
 
 
-def test_a_move_out_of_the_margin_band_may_approach_the_face_but_never_cross_it():
-    dip = motion.RECOVERY_DIP_MM
-    _check([335.0, 335.0 + dip - 0.5, 300.0])   # starts 5 mm inside, dips within the allowance
+def test_a_move_out_of_the_margin_band_keeps_half_the_margin():
+    """Starting 7.6 mm from the face (bob's taught ready pose), a move that ends
+    well inside may come to 5 mm (half the 10 mm margin) and no closer: the
+    margin is for model error, and leaving the band does not remove it."""
+    _check([332.4, 334.9, 300.0])        # 5.1 mm at its closest
     with pytest.raises(DeniedError):
-        _check([335.0, 335.0 + dip + 0.5, 300.0])   # a bigger dip: refused
+        _check([332.4, 335.5, 300.0])    # 4.5 mm: refused
+    # Starting closer than half the margin, it may come START_DIP_MM closer at
+    # most (the first millimetre of a line out of a pose), and never past the face.
+    _check([336.0, 336.0 + motion.START_DIP_MM - 0.1, 300.0])
     with pytest.raises(DeniedError):
-        _check([339.0, 340.5, 300.0])    # past the face: refused even though it ends inside
+        _check([336.0, 336.0 + motion.START_DIP_MM + 0.5, 300.0])
+    with pytest.raises(DeniedError):
+        _check([339.5, 340.2, 300.0])
+
+
+def test_recovering_from_one_face_does_not_license_another():
+    """Clearance is kept per face: an arm past x = 340 that is coming back in
+    may not use that as cover to approach the floor."""
+
+    class _TwoFace:
+        def points(self, q):
+            j = q["j"]
+            x = 345.0 - 45.0 * j                    # from 5 mm past x = 340 to 40 mm inside
+            z = 20.0 - 60.0 * j * (1 - j) * 4 / 3   # dips toward the floor in the middle
+            far = (0.0, 0.0, 100.0)
+            return {"tip": (x, 0.0, z), "wrist": far, "elbow": far}
+
+    with pytest.raises(DeniedError) as exc:
+        motion.check_line(_TwoFace(), BOX, {"j": 0.0}, {"j": 1.0}, offset={"j": 0.0},
+                          margin_mm=10.0, samples=200)
+    assert "z>=0" in exc.value.detail
 
 
 def test_a_move_that_stays_in_the_band_may_not_come_any_closer():
@@ -392,3 +417,251 @@ def test_a_plain_open_by_another_process_is_refused_while_the_gateway_holds_it(p
         assert exc.value.errno == errno.EBUSY
     finally:
         act_mod._release_serial(held)
+
+
+# --------------------------------------------------------------------------- #
+# Found by the independent review of the first version of these fixes
+# --------------------------------------------------------------------------- #
+
+def test_a_command_while_the_arm_is_busy_is_refused_not_queued(monkeypatch):
+    """Requests queued behind a long move each held a gateway thread, and a burst
+    of polls left the stop without one: a 25 s move ran to the end with a stop
+    sent at 5 s. Now a request waits BUS_WAIT_S for the bus, then is refused."""
+    monkeypatch.setattr(act_mod, "BUS_WAIT_S", 0.05)
+    actuator = SOArm101Actuator(protocol=MagicMock(read_position=MagicMock(return_value=2048)))
+    with act_mod._BUS_LOCK:                                  # a move is holding the bus
+        outcome = actuator.execute(envelope={"tool_name": "arm.state", "tool_args": {}},
+                                   manifest_path="", tier="read", config={})
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "busy"
+
+
+def test_the_stop_latches_even_while_another_request_holds_the_bus(monkeypatch):
+    monkeypatch.setattr(act_mod, "STOP_BUS_WAIT_S", 0.05)
+    actuator = SOArm101Actuator(protocol=_SaggingBus())
+    with act_mod._BUS_LOCK:
+        outcome = _estop(actuator)
+    assert actuator._latched()                   # motion is refused from here on
+    assert outcome.telemetry["estopped"] is True
+
+
+def test_a_repeated_stop_does_not_drive_a_joint_back_to_a_goal_it_has_lost():
+    """After a stop, a power cycle resets a servo's goal and the arm drops.
+    Re-sending the old hold would drive it back at top speed (2.4 m/s in sim)."""
+    bus = _SaggingBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    _estop(actuator)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    bus.goal[lift] = 1500                      # the goal reset; the joint now reads 1488
+    bus.writes.clear()
+    _estop(actuator)
+    assert (lift, 2048) not in bus.writes
+    assert (lift, 1500 - bus.sag) in bus.writes
+
+
+def test_a_stall_makes_the_move_longer_never_faster(fake_clock):
+    """Setpoints used to be due at fixed times, so after a stall the overdue
+    ones went out back to back (0.55 m/s against a 0.25 m/s limit)."""
+    state = {i: 2048 for i in range(1, 7)}
+    state.update({2: 1800, 3: 2300})
+    writes: list[float] = []
+    proto = MagicMock()
+    proto.read_position.side_effect = lambda motor_id: state[motor_id]
+
+    def write(motor_id, ticks):
+        state[motor_id] = ticks
+        if motor_id == 1:
+            writes.append(fake_clock.now)
+            if len(writes) == 20:
+                fake_clock.now += 0.3                       # the bus stalls once
+    proto.set_position.side_effect = write
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(M)
+    result = actuator._move_checked({"shoulder_pan": 0.5})
+    step = result["motion"]["pace_period_s"]
+    gaps = [b - a for a, b in zip(writes, writes[1:], strict=False)]
+    assert min(gaps) >= step - 1e-4      # telemetry rounds the period to 0.1 ms
+    assert max(gaps) >= 0.3 - 1e-6       # the stall itself is in there, and nothing made up for it
+
+
+def test_joints_that_do_not_move_the_tool_are_paced_too(fake_clock):
+    """With no joint limit declared, a wrist_roll move used to be one command at
+    the servo's top speed: it does not move the tool point, so the tool limit
+    never bound it."""
+    state = {i: 2048 for i in range(1, 7)}
+    state.update({2: 1800, 3: 2300})
+    proto = MagicMock()
+    proto.read_position.side_effect = lambda motor_id: state[motor_id]
+    proto.set_position.side_effect = lambda motor_id, ticks: state.__setitem__(motor_id, ticks)
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(M)
+    result = actuator._move_checked({"wrist_roll": 1.6})
+    assert result["motion"]["joint_speed_limit_dps"] == pytest.approx(90.0)
+    assert result["motion"]["setpoints"] > 20
+
+
+def _ready_arm(ticks: dict[int, int] | None = None):
+    state = {i: 2048 for i in range(1, 7)}
+    state.update({2: 1800, 3: 2300, 6: 1700})
+    state.update(ticks or {})
+    proto = MagicMock()
+    proto.read_position.side_effect = lambda motor_id: state[motor_id]
+    proto.set_position.side_effect = lambda motor_id, ticks: state.__setitem__(motor_id, ticks)
+    return state, proto
+
+
+def test_arm_home_brings_the_arm_home_though_the_taught_pose_is_inside_the_margin(
+        fake_clock, monkeypatch):
+    """bob's taught ready pose is 7.6 mm from x = 340, inside the 10 mm margin.
+    The first version refused arm.home from anywhere but home itself."""
+    monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD", (
+        '{"shoulder_lift": [-1.45, 1.0], "elbow_flex": [-0.19, 1.5], "wrist_flex": [-0.93, 1.5]}'))
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    away = actuator.execute(envelope={"tool_name": "arm.move_to",
+                                      "tool_args": {"x_mm": 150.0, "y_mm": 0.0, "z_mm": 50.0}},
+                            manifest_path=Path(M), tier="actuate", config={})
+    assert away.outcome_kind == "executed", away.error_message
+    home = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                            manifest_path=Path(M), tier="actuate", config={})
+    assert home.outcome_kind == "executed", home.error_message
+    # It may come as close as the taught pose itself, or half the margin, but
+    # no closer.
+    assert home.telemetry["motion"]["path_min_clearance_mm"] >= 5.0
+
+
+def test_a_taught_pose_outside_the_workspace_is_refused_with_the_fix_named(tmp_path, fake_clock):
+    text = Path(M).read_text()
+    manifest = tmp_path / "ROBOT.md"
+    # Every joint at mid-travel puts this arm's tip 13 mm past x = 340.
+    manifest.write_text(text.replace("shoulder_lift: 1800", "shoulder_lift: 2048")
+                        .replace("elbow_flex: 2300", "elbow_flex: 2048"))
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=manifest, tier="actuate", config={})
+    assert outcome.outcome_kind == "denied"
+    assert "taught pose" in outcome.telemetry["reason"]
+    proto.set_position.assert_not_called()
+
+
+def test_a_joint_parked_past_its_configured_range_can_still_be_brought_home(fake_clock):
+    """bob's firmware lets shoulder_lift reach -1.578 rad against a configured
+    -1.5. Setpoints between that start and the range used to fail conversion
+    half-way through a write."""
+    state, proto = _ready_arm({2: 1205})
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(M)
+    assert config.ticks_to_rad("shoulder_lift", 1205) < config.JOINTS["shoulder_lift"]["min_rad"]
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=Path(M), tier="actuate", config={})
+    assert outcome.outcome_kind == "executed", outcome.error_message
+
+
+def test_a_manifest_whose_geometry_cannot_be_read_refuses_motion(tmp_path, fake_clock):
+    """It used to leave the workspace and chain resolving to nothing, so a
+    shoulder swing into the floor executed unchecked."""
+    text = Path(M).read_text()
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(text.replace("  solver:\n", "  solver: [broken]\n  solver_was:\n", 1))
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=manifest, tier="actuate", config={})
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "manifest_unreadable"
+    proto.set_position.assert_not_called()
+
+
+def test_a_reach_point_step_the_workspace_refuses_is_a_signed_refusal(monkeypatch):
+    proto = MagicMock(read_position=MagicMock(return_value=2048))
+    actuator = SOArm101Actuator(protocol=proto)
+
+    def refuse(*args, **kwargs):
+        raise DeniedError("path_leaves_workspace", "the tip would come 3 mm from z>=0")
+
+    monkeypatch.setattr(actuator, "_move_checked", refuse)
+    outcome = _reach(actuator, [200.0, 0.0, 120.0])
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "path_leaves_workspace"
+
+
+def test_the_bare_move_to_alias_is_parsed_like_arm_move_to():
+    """It skipped argument parsing: a string coordinate and timeout_s=3600 went
+    through, and the bus was held for an hour."""
+    actuator = SOArm101Actuator(protocol=MagicMock())
+    outcome = actuator.execute(
+        envelope={"tool_name": "move_to",
+                  "tool_args": {"x_mm": "150", "y_mm": 0.0, "z_mm": 50.0, "timeout_s": 3600}},
+        manifest_path=Path(M), tier="actuate", config={})
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "bad_args"
+
+
+# --------------------------------------------------------------------------- #
+# Edges: a typo must not remove the margin; a servo that cannot say is unknown
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("raw", ["ten", "", "-1", "nan", "inf"])
+def test_a_margin_override_that_is_not_a_distance_is_refused_not_read_as_zero(monkeypatch, raw):
+    monkeypatch.setenv("SO_ARM101_WORKSPACE_MARGIN_MM", raw)
+    with pytest.raises(ValueError, match="SO_ARM101_WORKSPACE_MARGIN_MM"):
+        act_mod.resolve_workspace_margin_mm()
+
+
+def test_a_bad_margin_override_moves_nothing(monkeypatch, fake_clock):
+    monkeypatch.setenv("SO_ARM101_WORKSPACE_MARGIN_MM", "ten")
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=Path(M), tier="actuate", config={})
+    assert outcome.outcome_kind != "executed"
+    assert "SO_ARM101_WORKSPACE_MARGIN_MM" in (outcome.error_message or "")
+    proto.set_position.assert_not_called()
+
+
+def test_the_margin_override_narrows_or_widens_the_default(monkeypatch):
+    monkeypatch.delenv("SO_ARM101_WORKSPACE_MARGIN_MM", raising=False)
+    assert act_mod.resolve_workspace_margin_mm() == act_mod.WORKSPACE_MARGIN_MM
+    monkeypatch.setenv("SO_ARM101_WORKSPACE_MARGIN_MM", "5")
+    assert act_mod.resolve_workspace_margin_mm() == 5.0
+
+
+@pytest.mark.parametrize("reply", [OSError("no reply"), True, -1, 4096, 2048.0, None])
+def test_a_goal_register_that_cannot_answer_is_unknown_not_a_fault(reply):
+    proto = MagicMock()
+    if isinstance(reply, Exception):
+        proto.read_goal_position.side_effect = reply
+    else:
+        proto.read_goal_position.return_value = reply
+    assert SOArm101Actuator(protocol=proto)._read_goal_register("shoulder_lift") is None
+
+
+def test_a_bus_without_a_goal_register_plans_from_where_the_arm_reads():
+    proto = MagicMock(spec=["read_position", "set_position", "read_temperature"])
+    proto.read_position.return_value = 2000
+    actuator = SOArm101Actuator(protocol=proto)
+    assert actuator._read_goal_register("shoulder_lift") is None
+    start, offset = actuator._planning_start(["shoulder_lift"])
+    assert config.rad_to_ticks("shoulder_lift", start["shoulder_lift"]) == 2000
+    assert offset["shoulder_lift"] == 0.0
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), True, "0.1"])
+def test_a_joint_target_that_is_not_a_finite_number_never_reaches_the_bus(value, fake_clock):
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(M)
+    with pytest.raises(ValueError):
+        actuator._move_checked({"shoulder_pan": value}, speed=1.0, timeout_s=5.0)
+    proto.set_position.assert_not_called()
+
+
+def test_a_joint_target_past_its_configured_range_never_reaches_the_bus(fake_clock):
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(M)
+    beyond = config.JOINTS["shoulder_pan"]["max_rad"] + 0.1
+    with pytest.raises(ValueError):
+        actuator._move_checked({"shoulder_pan": beyond}, speed=1.0, timeout_s=5.0)
+    proto.set_position.assert_not_called()

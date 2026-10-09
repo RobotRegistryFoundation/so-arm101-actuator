@@ -269,6 +269,26 @@ class Box:
             best = min(best, value - low, high - value)
         return best
 
+    #: The six faces, in the order :meth:`clearances` reports them.
+    FACES = ("x_low", "x_high", "y_low", "y_high", "z_low", "z_high")
+
+    def clearances(self, point: tuple[float, float, float]) -> tuple[float, ...]:
+        """The distance to each face (see FACES), in mm, negative past it; +inf
+        for a face the manifest leaves out. A path check that keeps one number
+        per point lets an arm that is recovering from one face move toward a
+        different one; per-face numbers do not."""
+        out = []
+        for value, low, high in zip(point, self.low, self.high, strict=True):
+            out.append(value - low)
+            out.append(high - value)
+        return tuple(out)
+
+    def face_name(self, index: int) -> str:
+        """``"x>=-200"`` or ``"z<=250"`` for face ``index`` of :meth:`clearances`."""
+        axis = "xyz"[index // 2]
+        return f"{axis}>={self.low[index // 2]:g}" if index % 2 == 0 \
+            else f"{axis}<={self.high[index // 2]:g}"
+
     def nearest_face(self, point: tuple[float, float, float]) -> str:
         """The face :meth:`clearance` measured to, as ``"z>=0"`` or ``"x<=340"``."""
         best, name = math.inf, "none"
@@ -300,15 +320,23 @@ def workspace_box(manifest_path: str | None = None) -> Box | None:
 DEFAULT_MAX_TOOL_SPEED_MPS = 0.25
 
 
+#: Joint speed limit when the manifest declares none. Joints that do not move
+#: the tool point (wrist_roll, the gripper) are paced by this alone; without it
+#: they went as one command at the servo's top speed.
+DEFAULT_MAX_JOINT_SPEED_DPS = 90.0
+
+
 def declared_speed_limits(manifest_path: str | None = None) -> dict:
     """The speed limits this robot's manifest declares, with where each came from.
 
-    ``safety.max_linear_velocity_ms`` (the schema's linear speed limit, m/s) is
-    read as the TOOL POINT's speed limit on this arm; absent, it is
-    :data:`DEFAULT_MAX_TOOL_SPEED_MPS`. ``safety.max_joint_velocity_dps`` is the
-    per-joint limit; absent, no joint limit applies beyond the tool's. A value
-    that is not a positive finite number is treated as absent rather than as
-    permission: a typo must not mean "unlimited".
+    The tool point's limit is ``safety.max_tool_velocity_ms`` (m/s); absent,
+    :data:`DEFAULT_MAX_TOOL_SPEED_MPS`. ``safety.max_linear_velocity_ms``, which
+    the schema documents for wheeled bases, can only LOWER that: on a mobile
+    manipulator it is the base's speed, and reading it as the arm's would let a
+    0.4 m/s base raise the arm's limit. ``safety.max_joint_velocity_dps`` is the
+    per-joint limit; absent, :data:`DEFAULT_MAX_JOINT_SPEED_DPS`. A value that is
+    not a positive finite number is treated as absent rather than as permission:
+    a typo must not mean "unlimited".
     """
     safety = frontmatter(manifest_path).get("safety") or {}
 
@@ -318,12 +346,18 @@ def declared_speed_limits(manifest_path: str | None = None) -> dict:
         value = float(value)
         return value if math.isfinite(value) and value > 0 else None
 
-    tool = _positive(safety.get("max_linear_velocity_ms"))
+    tool = _positive(safety.get("max_tool_velocity_ms"))
+    source = "manifest" if tool is not None else "default"
+    tool = tool if tool is not None else DEFAULT_MAX_TOOL_SPEED_MPS
+    linear = _positive(safety.get("max_linear_velocity_ms"))
+    if linear is not None and linear < tool:
+        tool, source = linear, "manifest (max_linear_velocity_ms)"
     joint = _positive(safety.get("max_joint_velocity_dps"))
     return {
-        "tool_mps": tool if tool is not None else DEFAULT_MAX_TOOL_SPEED_MPS,
-        "tool_source": "manifest" if tool is not None else "default",
-        "joint_dps": joint,
+        "tool_mps": tool,
+        "tool_source": source,
+        "joint_dps": joint if joint is not None else DEFAULT_MAX_JOINT_SPEED_DPS,
+        "joint_source": "manifest" if joint is not None else "default",
     }
 
 
