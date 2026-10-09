@@ -317,9 +317,10 @@ IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
 #: the telemetry the gateway signs, so nobody reads "e-stop" on a receipt and
 #: infers a hardware interlock that does not exist here.
 ESTOP_SAFETY_NOTE = (
-    "SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint to "
-    "its current encoder reading so motion stops) - NOT a hardware e-stop. The "
-    "SCS bus exposes no torque-off here, and software cannot guarantee the arm "
+    "SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent a "
+    "goal to hold: the goal it was holding, or where it reads if it was moving; "
+    "a repeated stop re-sends the same goals) - NOT a hardware e-stop. The SCS "
+    "bus exposes no torque-off here, and software cannot guarantee the arm "
     "physically stopped."
 )
 
@@ -395,11 +396,17 @@ def _denied(exc: DeniedError) -> ActuatorOutcome:
 def _parse_move_to_args(tool_args: dict) -> dict:
     """Validate `arm.move_to`'s wire arguments into keyword arguments.
 
+    ``execute`` has already refused a ``tool_args`` that is not an object;
+    this checks it again so a direct caller gets a refusal, not a TypeError.
+
     Strict on purpose. A missing coordinate is not zero, an unknown argument is
     not ignorable (a caller who wrote ``z`` instead of ``z_mm`` means to move
     somewhere, and silently dropping it moves the arm somewhere else), and a
     string "150" is a client that has not decided what its numbers are.
     """
+    if not isinstance(tool_args, dict):
+        raise DeniedError("bad_args",
+                          f"tool_args must be an object, got {type(tool_args).__name__}")
     coords: dict[str, float] = {}
     for name in ("x_mm", "y_mm", "z_mm"):
         if name not in tool_args:
@@ -1177,8 +1184,9 @@ class SOArm101Actuator:
                                motion.MAX_MOVE_S
 
         ``speed`` (0, 1] is the fraction of the declared speed limits the move
-        may use: the tool point's (``safety.max_linear_velocity_ms``, or 0.25
-        m/s when the manifest declares none) and each joint's
+        may use: the tool point's (``safety.max_tool_velocity_ms``, or 0.25
+        m/s when the manifest declares none; ``max_linear_velocity_ms`` can
+        only lower it, see kinematics.declared_speed_limits) and each joint's
         (``safety.max_joint_velocity_dps``). The servo bus this driver owns takes
         Goal_Position and nothing else, so a speed limit is a stream of small
         setpoints (motion.PACE_PERIOD_S apart), each sized so the tool cannot be
@@ -1446,10 +1454,10 @@ class SOArm101Actuator:
         # must not reach the bus at all, and a stop must not depend on any of
         # the geometry the motion tools need to be correct.
         #
-        # SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint
-        # to its current encoder reading so motion stops) - NOT a hardware
-        # e-stop. The SCS bus exposes no torque-off here, and software cannot
-        # guarantee the arm physically stopped.
+        # SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent
+        # a goal to hold, chosen once per latch; see ESTOP_SAFETY_NOTE) - NOT a
+        # hardware e-stop. The SCS bus exposes no torque-off here, and software
+        # cannot guarantee the arm physically stopped.
         if tool_name == "arm.estop":
             transport = self._estop_transport(port=port, baud=baud)
             # LATCH FIRST, outside the bus lock. A paced move holds that lock for
@@ -1511,6 +1519,15 @@ class SOArm101Actuator:
                     "note": "cleared; the arm holds its pose until commanded",
                 },
             )
+        # Every tool below reads its arguments as an object. A signed request
+        # whose tool_args is a number, a string or a list is a bad argument
+        # and gets a signed refusal, not an AttributeError or TypeError out of
+        # execute (a 500). The stops above ignore their arguments, so no
+        # malformed argument can refuse a stop.
+        if not isinstance(tool_args, dict):
+            return _denied(DeniedError(
+                "bad_args",
+                f"tool_args must be an object, got {type(tool_args).__name__}"))
         if tool_name in MOTION_CAPABILITIES:
             # `_estopped` is the transport's own latch - read, never copied. A
             # second copy of this flag is a second thing that can be stale, and

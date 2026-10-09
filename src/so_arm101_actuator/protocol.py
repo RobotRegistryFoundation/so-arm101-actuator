@@ -94,12 +94,34 @@ class SCSProtocol:
         )
         self._serial.write(pkt)
         # Status packet: FF FF ID LEN ERR LO HI CKS = 8 bytes
-        resp = self._serial.read(8)
-        if len(resp) < 8 or resp[:2] != b"\xff\xff":
-            from so_arm101_actuator.errors import ProtocolError
-            raise ProtocolError(f"bad header: {resp!r}")
-        lo, hi = resp[5], resp[6]
+        lo, hi = self._read_status(motor_id, 2, what="Present_Position")
         return lo | (hi << 8)
+
+    def _read_status(self, motor_id: int, n: int, *, what: str,
+                     allow_error: bool = True) -> bytes:
+        """Read the status packet answering a READ of ``n`` bytes, and refuse
+        one that is not that answer: wrong length, header, servo id, length
+        byte or checksum (a stale packet left in the buffer, another servo's
+        reply, line noise). With ``allow_error=False`` a set error byte
+        (voltage, angle, overheat, overload) is refused too. Returns the data.
+        """
+        from so_arm101_actuator.errors import ProtocolError
+
+        resp = self._serial.read(6 + n)
+        if len(resp) < 6 + n or resp[:2] != b"\xff\xff":
+            raise ProtocolError(f"bad header reading {what} from servo {motor_id}: {resp!r}")
+        body = resp[2:-1]
+        if body[0] != motor_id:
+            raise ProtocolError(
+                f"reply to a {what} read of servo {motor_id} came from servo {body[0]}: {resp!r}")
+        if body[1] != n + 2:
+            raise ProtocolError(f"bad length reading {what} from servo {motor_id}: {resp!r}")
+        if (~sum(body)) & 0xFF != resp[-1]:
+            raise ProtocolError(f"bad checksum reading {what} from servo {motor_id}: {resp!r}")
+        if body[2] and not allow_error:
+            raise ProtocolError(
+                f"servo {motor_id} flagged error 0x{body[2]:02x} reading {what}: {resp!r}")
+        return bytes(body[3:3 + n])
 
     def read_goal_position(self, motor_id: int) -> int:
         """Read Goal_Position (2 bytes) from `motor_id`: the setpoint the servo
@@ -111,11 +133,9 @@ class SCSProtocol:
             params=params,
         )
         self._serial.write(pkt)
-        resp = self._serial.read(8)
-        if len(resp) < 8 or resp[:2] != b"\xff\xff":
-            from so_arm101_actuator.errors import ProtocolError
-            raise ProtocolError(f"bad header: {resp!r}")
-        lo, hi = resp[5], resp[6]
+        # Trusted as a move's starting point and as a stop's hold, so a reply
+        # with the servo's error byte set is refused as well as a malformed one.
+        lo, hi = self._read_status(motor_id, 2, what="Goal_Position", allow_error=False)
         return lo | (hi << 8)
 
     def read_temperature(self, motor_id: int) -> int:
@@ -128,11 +148,7 @@ class SCSProtocol:
         )
         self._serial.write(pkt)
         # 1-byte data → 7-byte status
-        resp = self._serial.read(7)
-        if len(resp) < 7 or resp[:2] != b"\xff\xff":
-            from so_arm101_actuator.errors import ProtocolError
-            raise ProtocolError(f"bad header: {resp!r}")
-        return resp[5]
+        return self._read_status(motor_id, 1, what="Present_Temperature")[0]
 
     def ping(self, motor_id: int) -> bool:
         """Send a PING to `motor_id`. Returns True if a response is received."""

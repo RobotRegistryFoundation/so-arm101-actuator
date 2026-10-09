@@ -10,10 +10,11 @@ It is purely ADDITIVE: the original ``SOArm101Actuator`` and its entry point are
 unchanged. To run the arm through the HAL, wrap this in
 ``castor_hal.TransportActuator`` (see ``make_hal_actuator``).
 
-SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint to its
-current encoder reading so motion stops) — NOT a hardware e-stop. The SCS bus
-exposes no torque-off here, and software cannot guarantee the arm physically
-stopped. See ``castor_hal.transport`` for the binding safety note.
+SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent a goal
+to hold: the goal it was holding, or where it reads if it was moving; a repeated
+stop re-sends the same goals) — NOT a hardware e-stop. The SCS bus exposes no
+torque-off here, and software cannot guarantee the arm physically stopped. See
+``castor_hal.transport`` for the binding safety note.
 """
 
 from __future__ import annotations

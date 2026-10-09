@@ -27,8 +27,9 @@ nothing bounded speed.
   (a move leaving the band keeps half of it, or comes at most 1 mm closer and
   never past the face, as planned, when it starts nearer than that; an arm past
   a face may go 2 mm further on that face only, on its way back in; the taught
-  pose can be reached though it is inside the margin), and streamed as setpoints at least 20 ms apart
-  (never catching up after a stall) under the declared speed limits. New deny
+  pose can be reached though it is inside the margin), and streamed as setpoints evenly spaced in
+  time, at most 20 ms apart and each sized so the step stays under the declared speed limits
+  (never catching up after a stall). New deny
   codes: `path_leaves_workspace`, `too_slow`, `busy`, `manifest_unreadable`.
   **No target closer than the margin to a face is accepted.**
 - **`speed` means the fraction of the declared limits.** 1.0 (the default) used

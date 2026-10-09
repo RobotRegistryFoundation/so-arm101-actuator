@@ -1083,3 +1083,37 @@ def test_the_adoption_window_can_be_widened_for_a_heavier_arm(monkeypatch):
     lift = config.JOINTS["shoulder_lift"]["motor_id"]
     _estop(actuator)
     assert bus.goal[lift] == 2048
+
+
+@pytest.mark.parametrize("tool", ["arm.reach_point", "arm.move_to", "move_to", "arm.reach",
+                                  "arm.home", "arm.state", "status.report"])
+@pytest.mark.parametrize("bad", [1, "x=210", [210, 0, 10], 2.5, True])
+def test_tool_args_that_are_not_an_object_get_a_signed_refusal(tool, bad):
+    """Review of #7: `tool_args: 1` used to raise AttributeError or TypeError
+    out of execute, which the gateway turns into a 500, not a signed 403."""
+    from unittest.mock import MagicMock as _Mock
+    from so_arm101_actuator.actuator import SOArm101Actuator as _Act
+
+    proto = _Mock()
+    actuator = _Act(protocol=proto)
+    outcome = actuator.execute(
+        envelope={"tool_name": tool, "tool_args": bad, "scope": "MANIPULATE"},
+        manifest_path=Path(FIXTURE_MANIFEST), tier="actuate", config={})
+    assert outcome.outcome_kind == "denied", outcome
+    assert outcome.telemetry["deny"] == "bad_args"
+    proto.set_position.assert_not_called()
+
+
+@pytest.mark.parametrize("bad", [1, "stop", [1, 2]])
+def test_malformed_tool_args_cannot_refuse_a_stop(bad):
+    from unittest.mock import MagicMock as _Mock
+    from so_arm101_actuator.actuator import SOArm101Actuator as _Act
+
+    proto = _Mock()
+    proto.read_position.return_value = 2048
+    proto.read_goal_position.return_value = 2048
+    actuator = _Act(protocol=proto)
+    outcome = actuator.execute(
+        envelope={"tool_name": "arm.estop", "tool_args": bad, "scope": "OBSERVE"},
+        manifest_path=Path(FIXTURE_MANIFEST), tier="read", config={})
+    assert outcome.telemetry.get("estopped") is True
