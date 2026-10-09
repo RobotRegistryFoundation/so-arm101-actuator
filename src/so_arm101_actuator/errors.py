@@ -17,6 +17,15 @@ class ActuatorTimeoutError(TimeoutError):
     """Raised when a blocking actuator call exceeds its timeout."""
 
 
+class MotionStopped(Exception):
+    """A move was abandoned part-way because ``arm.estop`` arrived.
+
+    Not a refusal (the move was allowed and had started) and not a fault (the
+    driver did exactly what it should): the arm is held where the stop found
+    it, and the receipt says so.
+    """
+
+
 class DeniedError(Exception):
     """A refusal the caller must read as a DECISION, not as a fault.
 

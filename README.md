@@ -8,16 +8,22 @@ RPN-000000000002 · `pip install so-arm101-actuator`
 ```python
 from so_arm101_actuator import SOArm101Actuator
 
-actuator = SOArm101Actuator.from_default_port()  # /dev/ttyACM0 @ 1 Mbps
+actuator = SOArm101Actuator.from_default_port()  # /dev/ttyACM0 @ 1 Mbps, held exclusively
 actuator.home()
-actuator.move({"shoulder_pan": 0.3})
+actuator.move_paced({"shoulder_pan": 0.3})
 print(actuator.read_state())
 ```
 
 ## Capabilities
 
-- `move(joint_positions, *, timeout_s=5.0)` — drive named joints to target radians; blocks until in tolerance or timeout.
-- `home(*, timeout_s=10.0)` — move to the configured zero pose.
+- `move_paced(joint_positions, *, speed=1.0, timeout_s=5.0)` — drive named joints to
+  target radians at no more than the declared rates, along a path checked against
+  the declared workspace before anything moves (v0.4.0+). Every gateway tool uses this.
+- `move(joint_positions, *, timeout_s=5.0)` — **raw**: one Goal_Position per joint, run at
+  the servos' own top speed, no workspace check. For bring-up tools (the sweep CLI);
+  nothing the gateway serves starts a motion with it.
+- `home(*, timeout_s=10.0, speed=1.0)` — move to the configured home pose, paced and
+  checked like `move_paced` (v0.4.0+; one direct command before).
 - `read_state()` — snapshot positions + best-effort motor temperatures.
 - `move_to(*, x_mm, y_mm, z_mm, speed=1.0)` — put the tool tip on a point in the
   arm's base frame, tool pointing straight down (v0.3.0+).
@@ -32,12 +38,52 @@ The gateway invokes these by their ROBOT.md capability names:
 
 | Tool | Scope | Tiers | Driver method |
 |---|---|---|---|
-| `arm.home` | MANIPULATE | actuate, commission | `home` |
-| `arm.reach` | MANIPULATE | actuate, commission | `move` (to the taught pose) |
+| `arm.home` | MANIPULATE | actuate, commission | `move_paced` (to the taught pose) |
+| `arm.reach` | MANIPULATE | actuate, commission | `move_paced` (to the taught pose) |
 | `arm.reach_point` | MANIPULATE | actuate, commission | `reach_point` |
 | `arm.move_to` | MANIPULATE | actuate, commission | `move_to` |
 | `arm.state` | OBSERVE | read, actuate, commission | `state` |
 | `status.report` | OBSERVE | read, actuate, commission | `read_state` |
+| `arm.estop` | any | read, actuate, commission | software hold (see below) |
+| `arm.estop.clear` | any | commission | releases the latch |
+
+Since v0.4.0 the scope is enforced for motion tools: an envelope that names a motion
+tool under a scope other than MANIPULATE, NAVIGATE, ACTUATE, EXECUTE or COMMISSION is
+refused with `scope_mismatch` and nothing moves. No scope can refuse `arm.estop`.
+
+## Motion limits (v0.4.0+)
+
+Found by the EV-03 hostile-model test (software in the loop through robot-md-gateway,
+8 October 2026), and what changed:
+
+- **Speed is spelled as time.** The bus takes Goal_Position and nothing else, and a
+  servo runs to a goal at its own top speed, so one direct command was a full-speed move
+  whatever `speed` said (EV-03: 270 °/s against the preset's declared 180 °/s; tip up to
+  1.6 m/s). Every motion is now walked one small step per 20 ms control period, sized so
+  no joint exceeds `speed` × `safety.max_joint_velocity_dps` (rounding to whole encoder
+  ticks included). A manifest that declares no joint rate gets 30 °/s, robot-md's
+  first-motion default — never "unlimited". `safety.max_linear_velocity_ms`, when
+  declared, bounds the tool tip too.
+- **The path is checked, not just its ends.** The straight joint-space line between two
+  poses stays inside the joint safe ranges, but the declared workspace is a box in
+  Cartesian space and the tip's path along that line is curved: between two allowed
+  targets it dipped 11–13 mm below the declared floor. The whole line is now checked
+  before anything moves (sampled at ≤ 1 mm of tip travel by a lever-arm bound, with the
+  segments between samples bounded too); a path that leaves is refused with
+  `path_leaves_workspace`. An arm that starts outside may only move in ways that never
+  make it worse.
+- **The check is on the commanded path.** A loaded servo settles short of its goal, so
+  the real tip can sit past a face the commanded path only touches (EV-03, simulated with
+  bob's measured sag: up to a few mm below the floor at floor targets).
+  `SO_ARM101_WORKSPACE_MARGIN_MM` keeps the commanded path that far inside every face;
+  set it to the tip error you measure on your arm. Default 0.
+- **`arm.reach_point` checks the declared workspace** (it checked only that the links
+  could span the point, and walked to z = −101.7 mm), takes the bus lock, and opens the
+  port itself (its first call on a fresh gateway used to be an HTTP 500).
+- **The servo bus is held exclusively.** The port is opened with `exclusive=True` (flock)
+  and `TIOCEXCL`, so any other non-root process that opens it — LeRobot, a terminal, a
+  script — gets `EBUSY` while the driver holds it. EV-03 showed a second process under the
+  same uid writing Goal_Position packets onto the bus while the gateway was running.
 
 ## Cartesian control (v0.3.0+)
 
@@ -57,8 +103,8 @@ Request to `POST /v1/invoke`:
 }
 ```
 
-with `Authorization: Bearer <actuate-tier token>`. `speed` is optional and in
-(0, 1]; `x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
+with `Authorization: Bearer <actuate-tier token>`. `speed` is optional, in
+[0.01, 1], a fraction of the declared rates; `x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
 (`physics.solver.base_frame`: z up, x forward) and name the **tool tip**, not
 the wrist flange.
 
@@ -80,13 +126,16 @@ Response (`200`):
       "wrist_roll": -0.21475731030398976
     },
     "eef_mm": {"x": 150.08, "y": 0.0, "z": 49.89},
-    "elapsed_s": 0.0338,
+    "elapsed_s": 0.94,
     "max_error_rad": 0.00076,
     "error_mm": 0.14,
     "target_mm": {"x": 150.0, "y": 0.0, "z": 50.0},
     "speed": 0.5,
-    "waypoints": 2,
-    "ik_provider": "inhouse-so-arm101"
+    "waypoints": 48,
+    "ik_provider": "inhouse-so-arm101",
+    "paced_s": 0.96,
+    "joint_speed_limit_dps": 90.0,
+    "path_min_clearance_mm": 6.55
   },
   "attestation": "attested",
   "outcome": {"...": "the Ed25519-signed receipt"},
@@ -122,13 +171,16 @@ same thing as a sentence, and may be reworded:
 
 | `deny` | Meaning |
 |---|---|
-| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` outside (0, 1] |
+| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` outside [0.01, 1] |
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
 | `unreachable` | the links do not span it with the tool vertical |
 | `joint_limits` | solvable, but outside a joint's declared `limits_deg` |
 | `frame_disagreement` | the solve and forward kinematics disagree about where the pose puts the tip |
 | `unsafe_pose` | inside the declared limits, outside this rig's **measured** `SAFE_RANGE_RAD` |
 | `unsafe_start` | the arm is parked outside that envelope — run `arm.home` first |
+| `path_leaves_workspace` | both ends are inside, the tip's path between them is not (or it enters `SO_ARM101_WORKSPACE_MARGIN_MM`) |
+| `too_slow` | at this `speed` the move would take longer than 30 s |
+| `scope_mismatch` | a motion tool under a non-actuation scope |
 | `ik_provider_mismatch` | the manifest names a solver this driver does not implement |
 | `no_kinematics` | the manifest declares no chain to solve against |
 
@@ -286,7 +338,7 @@ python -m so_arm101_actuator.sweep
 python -m so_arm101_actuator.sweep --dry-run --iterations 10 --seed 42 --out /tmp/poses.jsonl
 ```
 
-The sweep CLI is for hands-on hardware bring-up + demos. Cert evidence (`bob.local/FULL-SWEEP-100`) does NOT come from this CLI; it comes from `opencastor-ops/scripts/hil/` orchestrating pre-signed envelopes through `robot-md-gateway`.
+The sweep CLI is for hands-on hardware bring-up + demos. It uses the raw `move()`: full servo speed, no workspace check. Run it with a hand on the power. Cert evidence (`bob.local/FULL-SWEEP-100`) does NOT come from this CLI; it comes from `opencastor-ops/scripts/hil/` orchestrating pre-signed envelopes through `robot-md-gateway`.
 
 ## Calibration (v0.2.1+)
 

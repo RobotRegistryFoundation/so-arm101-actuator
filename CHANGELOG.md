@@ -6,6 +6,72 @@ All notable changes to `so-arm101-actuator`. Format loosely follows
 Entries before 0.3.0 are reconstructed from the git history — this file did not
 exist while they shipped.
 
+## [0.4.0]
+
+Found by the EV-03 hostile-model test: a fuzzer in the model's seat, sending signed
+`arm.move_to` envelopes through the real robot-md-gateway to this driver, with only the
+serial port simulated (bob's calibration and gravity sag), 8 October 2026. Results and
+the harness are in the EV-03 test kit.
+
+### Changed (behaviour)
+
+- **Every motion is paced.** `speed` is now a fraction of the declared rates
+  (`safety.max_joint_velocity_dps`; `safety.max_linear_velocity_ms` for the tool tip
+  when declared), walked one step per 20 ms control period. `speed: 1.0` used to be one
+  direct Goal_Position per joint, which the servos run at their own top speed: EV-03
+  measured 270 °/s against 180 declared, and the tip at up to 1.6 m/s. A manifest that
+  declares no joint rate gets 30 °/s (robot-md's first-motion default). `arm.home`,
+  `arm.reach`, the `move` and `home` verbs and every `arm.reach_point` step are paced
+  the same way. `speed` must be in [0.01, 1]; a move that would take longer than 30 s is
+  refused (`too_slow`).
+- **The path is checked before anything moves.** The tip's path along the joint-space
+  line is checked against `physics.workspace.bounds_mm`, sampled at ≤ 1 mm of tip travel
+  by a lever-arm bound with the segments between samples bounded too, and refused with
+  `path_leaves_workspace` when it leaves. Both ends were checked before; between two
+  allowed targets the tip went 11–13 mm below the declared floor. An arm that starts
+  outside may only move in ways that do not make it worse.
+  `SO_ARM101_WORKSPACE_MARGIN_MM` keeps the commanded path that far inside every face
+  (default 0); the check is on the commanded path, and a loaded servo settles short of
+  its goal.
+- **`arm.reach_point` checks the declared workspace** (it checked reach only, and walked
+  to z = −101.7 mm), runs under the bus lock, and opens the port itself (its first call
+  on a fresh gateway was an HTTP 500, AttributeError).
+- **Scope is enforced for motion tools.** An envelope that names a motion tool under a
+  non-actuation scope (OBSERVE, say) is refused with `scope_mismatch`; it used to
+  execute. No scope can refuse `arm.estop`.
+- **A stop interrupts the move it is meant to stop.** `arm.estop` latches and signals
+  before it waits for the bus; every motion loop checks between bus writes and gives the
+  bus up within one control period. The stop used to queue behind the move's bus lock and
+  take effect only after the motion had finished. An interrupted move returns
+  `outcome_kind: "error"` with `telemetry.stopped: true`.
+- **A repeated stop re-sends the first hold.** Each `arm.estop` used to send the
+  encoder reading as the new goal; a loaded joint settles below its goal, so repeated
+  stops ratcheted the arm down (EV-03, simulated: z 185 → −227 mm over 200 read-tier
+  stops). The first stop of a latch takes the reading; repeats re-send it
+  (`telemetry.hold_reasserted`); `arm.estop.clear` releases it.
+- **The servo bus is held exclusively** (`exclusive=True` plus `TIOCEXCL`): any other
+  non-root process that opens the port gets `EBUSY`. A port that cannot be claimed is
+  not used. On a bus error the handle is closed before it is dropped, so the re-open is
+  not refused by our own claim.
+- Subnormal speeds (5e-324, 1e-309) are a `bad_args` deny; they overflowed
+  `ceil(1/speed)` and came back as HTTP 500.
+
+### Added
+
+- `move_paced()` and `motion.py` (limits from the manifest, the lever-arm bound, the
+  planner and the path check).
+- `MoveToResult`: `paced_s`, `joint_speed_limit_dps`, `path_min_clearance_mm`.
+  `waypoints` now counts paced steps.
+- `tests/test_ev03_findings.py`: one or more regression tests per finding.
+
+### Not changed
+
+- `move()` stays raw (full servo speed, no workspace check). The sweep CLI uses it;
+  nothing the gateway serves starts a motion with it. The castor-hal transport's
+  `JOINT_POSITIONS` goal still calls it.
+- The first stop on a loaded arm still lets each joint settle by its static error once
+  (one sag step, a few mm at the tip in simulation). Check it on the arm.
+
 ## [0.3.0]
 
 ### Added

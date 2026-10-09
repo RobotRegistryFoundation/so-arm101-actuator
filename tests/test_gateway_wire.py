@@ -65,7 +65,7 @@ def signed_manifest(tmp_path) -> tuple[Path, bytes]:
 
 
 @pytest.fixture
-def client(signed_manifest):
+def client(signed_manifest, fake_clock):
     path, pub_pem = signed_manifest
 
     class _Resolver:
@@ -73,7 +73,8 @@ def client(signed_manifest):
             return pub_pem if kid == KID else None
 
     proto = MagicMock()
-    state = {i: 2048 for i in range(1, 7)}
+    # The fixture's taught `ready` pose: inside the declared workspace.
+    state = {1: 2048, 2: 1800, 3: 2300, 4: 2048, 5: 2048, 6: 1700}
     proto.set_position.side_effect = lambda motor_id, ticks: state.__setitem__(motor_id, ticks)
     proto.read_position.side_effect = lambda motor_id: state.get(motor_id, 2048)
     proto.read_temperature.return_value = 30
@@ -134,7 +135,10 @@ def test_arm_move_to_on_the_wire(client, monkeypatch):
     assert telemetry["eef_mm"]["x"] == pytest.approx(150.0, abs=0.5)
     assert telemetry["eef_mm"]["z"] == pytest.approx(50.0, abs=0.5)
     assert telemetry["speed"] == 0.5
-    assert telemetry["waypoints"] == 2
+    # Paced: one step per control period, at half the declared joint rate.
+    assert telemetry["waypoints"] > 1
+    assert telemetry["paced_s"] > 0
+    assert telemetry["path_min_clearance_mm"] >= 0
     assert telemetry["ik_provider"] == "inhouse-so-arm101"
     assert set(telemetry["final_positions"]) == {
         "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"}

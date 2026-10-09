@@ -59,6 +59,12 @@ class SOArm101Transport(Transport):
         self._move_timeout_s = move_timeout_s
         self._home_timeout_s = home_timeout_s
         self._estopped = False
+        #: Goal ticks the first stop of the current latch sent, by motor id.
+        #: Repeated stops re-send these rather than re-reading the encoders.
+        self._held_ticks: dict[int, int] | None = None
+        #: Whether the last estop() re-sent an existing hold (True) or took a
+        #: new one (False). Reported on the receipt.
+        self.last_estop_reasserted: bool | None = None
 
     @classmethod
     def from_config(cls, config_dict: dict | None) -> "SOArm101Transport":
@@ -142,6 +148,19 @@ class SOArm101Transport(Transport):
             timestamp_s=st["timestamp_s"],
         )
 
+    def request_stop(self) -> None:
+        """Latch, and tell any move in progress to give up the bus.
+
+        Touches no hardware and takes no lock, so it can run while another
+        thread is mid-move: that move checks the actuator's stop event between
+        bus writes and abandons the motion, and the hold in ``estop`` then runs
+        on a bus nobody else is writing to.
+        """
+        self._estopped = True
+        stop_event = getattr(self._actuator, "_stop_requested", None)
+        if stop_event is not None:
+            stop_event.set()
+
     def estop(self) -> None:
         """Best-effort SOFTWARE hold (NOT a hardware e-stop — see module note).
         Commands each joint to its current encoder reading so motion stops, then
@@ -151,14 +170,34 @@ class SOArm101Transport(Transport):
         so if the link is down (``open`` raises) or the hold cannot be sent, the
         transport stays e-stopped and refuses new motion (``clear_estop`` +
         retry to recover), rather than silently accepting motion after a stop we
-        couldn't confirm. We fail toward stopped, never toward movable."""
-        self._estopped = True
+        couldn't confirm. We fail toward stopped, never toward movable.
+
+        ONE ANCHOR PER LATCH. A loaded joint settles short of its goal, so its
+        encoder reading is below the goal it is holding; sending that reading as
+        the new goal lets it settle lower again. The first stop takes the
+        reading (it has to: the joint may be moving). A repeated stop while
+        latched re-sends that same hold instead of reading again: in EV-03 a
+        read-tier caller repeating arm.estop every 0.2 s sank the simulated tip
+        412 mm, from z = 185 to -227 mm, one re-anchor at a time."""
+        self.request_stop()
         self.open()
         proto = self._actuator._protocol
+        held = getattr(self, "_held_ticks", None)
         try:
-            for spec in config.JOINTS.values():
-                ticks = proto.read_position(motor_id=spec["motor_id"])
-                proto.set_position(motor_id=spec["motor_id"], ticks=ticks)
+            if held is None:
+                taken: dict[int, int] = {}
+                for spec in config.JOINTS.values():
+                    ticks = proto.read_position(motor_id=spec["motor_id"])
+                    proto.set_position(motor_id=spec["motor_id"], ticks=ticks)
+                    taken[spec["motor_id"]] = ticks
+                # Kept only once every joint is held: a partial record would make
+                # the next stop re-send a hold some joints never had.
+                self._held_ticks = taken
+                self.last_estop_reasserted = False
+            else:
+                for motor_id, ticks in held.items():
+                    proto.set_position(motor_id=motor_id, ticks=ticks)
+                self.last_estop_reasserted = True
         except (IOError, OSError) as exc:
             raise TransportError(
                 TransportErrorCode.IO_ERROR, f"e-stop could not command hold: {exc}"
@@ -166,6 +205,10 @@ class SOArm101Transport(Transport):
 
     def clear_estop(self) -> None:
         """Release the latched software e-stop so motion can be commanded again."""
+        self._held_ticks = None
+        stop_event = getattr(self._actuator, "_stop_requested", None)
+        if stop_event is not None:
+            stop_event.clear()
         self._estopped = False
 
 

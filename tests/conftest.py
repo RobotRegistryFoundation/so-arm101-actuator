@@ -67,3 +67,52 @@ class FakeSerial:
 
     def close(self) -> None:
         pass
+
+
+class FakeClock:
+    """Stands in for the actuator module's ``time``: ``sleep`` advances a
+    counter instead of waiting, so a paced move (one step per control period)
+    runs in microseconds and its timing can be asserted exactly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return self.now
+
+    perf_counter = monotonic
+
+    def time(self) -> float:
+        return 1_760_000_000.0 + self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += max(0.0, seconds)
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Run the actuator on simulated time (see FakeClock)."""
+    from so_arm101_actuator import actuator as actuator_module
+
+    clock = FakeClock()
+    monkeypatch.setattr(actuator_module, "time", clock)
+    return clock
+
+
+def manifest_with(tmp_path: Path, *, safety: dict | None = None,
+                  workspace: dict | None = None) -> str:
+    """The fixture manifest with a safety block and/or workspace bounds added."""
+    import yaml
+
+    text = Path(FIXTURE_MANIFEST).read_text()
+    end = text.find("\n---", 3)
+    front = yaml.safe_load(text[3:end]) or {}
+    if safety is not None:
+        front["safety"] = safety
+    if workspace is not None:
+        front.setdefault("physics", {}).setdefault("workspace", {})["bounds_mm"] = workspace
+    path = tmp_path / "ROBOT.md"
+    path.write_text("---\n" + yaml.safe_dump(front, sort_keys=False) + text[end:])
+    return str(path)

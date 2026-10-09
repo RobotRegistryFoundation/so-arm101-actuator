@@ -15,8 +15,8 @@ def main() -> None:
     actuator = SOArm101Actuator.from_default_port()
     actuator.home()
     for _ in range(3):
-        actuator.move({"shoulder_pan": 0.3}, timeout_s=2.0)
-        actuator.move({"shoulder_pan": -0.3}, timeout_s=2.0)
+        actuator.move_paced({"shoulder_pan": 0.3}, timeout_s=2.0)
+        actuator.move_paced({"shoulder_pan": -0.3}, timeout_s=2.0)
         time.sleep(0.1)
     actuator.home()
 
