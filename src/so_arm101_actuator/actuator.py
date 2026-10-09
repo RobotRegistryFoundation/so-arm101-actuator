@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -65,6 +66,30 @@ STOP_BUS_WAIT_S = 5.0
 
 #: The joints the kinematic chain walks; the gripper is not one of them.
 ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+
+
+def resolve_adopt_ticks() -> int:
+    """ADOPT_REFERENCE_TICKS, or SO_ARM101_ADOPT_REFERENCE_TICKS (0 to 1000).
+
+    An arm whose static sag passes the window drops by its sag each time a hold
+    or a move's start is chosen afresh, because a joint that far from its goal
+    reads as moving, stalled or pushed. Widening it for such an arm has a price:
+    a stop then keeps a goal up to that far away, so it finishes that much of a
+    move it did not pace (the castor-hal path's) and keeps pushing on a joint
+    stalled within it. Refused loudly when it is not a whole number in range.
+    """
+    import os
+
+    raw = os.environ.get("SO_ARM101_ADOPT_REFERENCE_TICKS")
+    if raw is None:
+        return ADOPT_REFERENCE_TICKS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"SO_ARM101_ADOPT_REFERENCE_TICKS: invalid whole number {raw!r}") from exc
+    if not 0 <= value <= 1000:
+        raise ValueError(f"SO_ARM101_ADOPT_REFERENCE_TICKS: must be 0 to 1000, got {raw!r}")
+    return value
 
 
 def resolve_workspace_margin_mm() -> float:
@@ -488,6 +513,7 @@ class SOArm101Actuator:
         self._held: dict[str, int] | None = None
         #: (manifest path, why) when that manifest's geometry could not be read.
         self._manifest_error: tuple[str, str] | None = None
+        self._manifest_stamp: float | None = None
 
     @classmethod
     def from_default_port(cls, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> "SOArm101Actuator":
@@ -643,17 +669,25 @@ class SOArm101Actuator:
         """The goal register if it is near the reading, else the reading. Falls
         back to the copy of what was last sent only when the register is None."""
         goal = register if register is not None else self._reference.get(joint)
-        return goal if goal is not None and abs(present - goal) <= ADOPT_REFERENCE_TICKS else present
+        return goal if goal is not None and abs(present - goal) <= resolve_adopt_ticks() else present
 
     def _read_goal_register(self, joint: str) -> int | None:
-        """Goal_Position as the servo reports it, or None when it cannot say."""
+        """Goal_Position as the servo reports it; None when this bus has no such read.
+
+        A read that fails is tried once more, and a second failure raises: a
+        failed read is a bus fault like any other. It used to read as "cannot
+        say", and the callers then fell back to the copy of what was last sent,
+        which a brown-out may have made stale (review: a one-setpoint jump at
+        1.8 m/s, and a repeated stop that lifted the arm 250 mm).
+        """
         reader = getattr(self._protocol, "read_goal_position", None)
         if reader is None:
             return None
+        motor = config.JOINTS[joint]["motor_id"]
         try:
-            value = reader(motor_id=config.JOINTS[joint]["motor_id"])
-        except Exception:  # noqa: BLE001 — no answer means "do not know", never a fault
-            return None
+            value = reader(motor_id=motor)
+        except Exception:  # noqa: BLE001 — one retry for a garbled reply; the second raises
+            value = reader(motor_id=motor)
         if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4095:
             return None
         return value
@@ -701,6 +735,16 @@ class SOArm101Actuator:
         speed = motion.validate_speed(speed)
 
         manifest = self._manifest_applied
+        # Asked again for every planned line, not only at the door: a manifest
+        # rewritten in place mid-call (reach_point plans up to 25) must not leave
+        # the next line planned against nothing.
+        if manifest:
+            problem = kin.geometry_problem(manifest)
+            if problem:
+                raise DeniedError(
+                    "manifest_unreadable",
+                    f"this robot's geometry could not be read from {manifest} ({problem}), "
+                    f"so no motion can be checked against it")
         joints = list(dict.fromkeys([*ARM_JOINTS, *joint_positions, *hold]))
         start, offset = self._planning_start(joints)
         goal = {**start, **{j: float(v) for j, v in joint_positions.items()}}
@@ -808,14 +852,27 @@ class SOArm101Actuator:
         fell) is chosen again from what it holds now: re-sending the old goal
         would drive it back unpaced (40 mm at 0.38 m/s, in simulation).
 
-        A servo that cannot report its goal register is taken to still hold
+        When the register read fails (twice), the stop does not fail with it.
+        It falls back to the rule that needs no register, which bounds what a
+        stale goal can cost: a joint within the adoption window of the goal
+        this latch chose keeps it, any other joint is held where it reads.
+
+        A bus with no such read at all (a test double) is taken to still hold
         what was sent: that cannot detect a reset, but it cannot ratchet.
         """
+        window = resolve_adopt_ticks()
         chosen: dict[str, int] = dict(self._held) if self._held is not None else {}
         for joint, spec in config.JOINTS.items():
             present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
-            register = self._read_goal_register(joint)
+            try:
+                register, failed = self._read_goal_register(joint), False
+            except Exception:  # noqa: BLE001 — the stop must not fail on a read
+                register, failed = None, True
             kept = chosen.get(joint)
+            if failed:
+                chosen[joint] = (kept if kept is not None and abs(present - kept) <= window
+                                 else present)
+                continue
             if kept is not None and (register is None or register == kept):
                 continue
             chosen[joint] = self._choose_hold(joint, present, register)
@@ -832,8 +889,19 @@ class SOArm101Actuator:
         stays out of motion because its fallback zero is wrong for this arm.
         """
         key = str(manifest_path) if manifest_path else ""
-        if not key or key == getattr(self, "_manifest_applied", None):
+        if not key:
             return
+        # Keyed on the file's mtime as well as its path: a manifest re-signed in
+        # place used to keep its old joint zeros and taught pose here while the
+        # box, the chain and the limits (read through kinematics' own mtime-keyed
+        # cache) moved on, so motion was checked on a model up to the change off.
+        try:
+            stamp: float | None = os.path.getmtime(key)
+        except OSError:
+            stamp = None
+        if key == getattr(self, "_manifest_applied", None) and stamp == self._manifest_stamp:
+            return
+        self._manifest_stamp = stamp
         try:
             _config_module.apply_manifest_calibration(key)
             self._gripper_calibrated = _config_module.gripper_geometry_known(key)
@@ -1388,14 +1456,19 @@ class SOArm101Actuator:
             # its whole stream and checks this latch before every setpoint, so
             # setting it here is what stops a move in progress within one pace
             # period. Waiting for the lock first would let the move finish.
+            already = bool(transport._estopped)
             transport._estopped = True
             held: dict[str, float] = {}
             try:
                 # Same lock every move takes: the hold writes a setpoint per
                 # joint, and a read interleaved into that sequence corrupts both.
-                # A move in progress lets go within one pace period of the latch,
-                # and while the stop waits every other request gives way to it.
-                with _bus(STOP_BUS_WAIT_S, stop=True):
+                # A move in progress lets go within one pace period of the latch.
+                # The stop that latches goes first: while it waits, every other
+                # request gives way. A stop repeated while already latched (there
+                # is nothing moving to stop) waits its turn like anything else:
+                # given priority, four looping read-tier stop clients locked
+                # every arm.estop.clear and state read out (found in review).
+                with _bus(STOP_BUS_WAIT_S, stop=not already):
                     transport.estop()
                     held = {joint: _config_module.ticks_to_rad(joint, ticks)
                             for joint, ticks in (self._held or {}).items()}
@@ -1452,13 +1525,13 @@ class SOArm101Actuator:
             # read leaves the workspace, the chain and the limits resolving to
             # nothing, and the move would go unchecked.
             # Asked on every motion, not once per path: the file can change under
-            # a running gateway (a re-signed manifest), and a YAML error reads as
-            # an empty manifest everywhere else, which declares no workspace.
+            # a running gateway (a re-signed manifest), and a YAML error or a
+            # malformed workspace reads as "no limits" everywhere else.
             key = str(manifest_path) if manifest_path else ""
             if key:
                 problem = (self._manifest_error[1]
                            if self._manifest_error is not None and self._manifest_error[0] == key
-                           else kin.frontmatter_problem(key))
+                           else kin.geometry_problem(key))
                 if problem:
                     return _denied(DeniedError(
                         "manifest_unreadable",

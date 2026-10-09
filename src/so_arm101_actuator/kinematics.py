@@ -332,6 +332,39 @@ class Box:
         return name
 
 
+def geometry_problem(manifest_path: str | None = None) -> str | None:
+    """Why this manifest cannot bound a motion, or None when it can.
+
+    Every motion is checked against the declared workspace with the declared
+    chain, and a manifest that parses but declares either wrongly used to leave
+    the check nothing to check against, which read as "no limits": `z: [0]`, a
+    misspelled `workspace` key or a missing `bounds_mm` let a joint move take the
+    tip 111 to 302 mm below the floor in review. Each axis must be two finite
+    numbers, low below high; declare an axis as wide as you like, but declare it.
+    """
+    problem = frontmatter_problem(manifest_path)
+    if problem:
+        return problem
+    bounds = (((frontmatter(manifest_path).get("physics") or {}).get("workspace") or {})
+              .get("bounds_mm"))
+    if not isinstance(bounds, dict) or not bounds:
+        return "it declares no physics.workspace.bounds_mm"
+    for axis in "xyz":
+        span = bounds.get(axis)
+        ok = (isinstance(span, (list, tuple)) and len(span) == 2
+              and all(isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+                      for v in span)
+              and span[0] < span[1])
+        if not ok:
+            return (f"physics.workspace.bounds_mm.{axis} is {span!r}, not [low, high] in "
+                    f"millimetres with low below high")
+    try:
+        Chain(manifest_path)
+    except Exception as exc:  # noqa: BLE001 — any reason the chain cannot be built
+        return f"its kinematic chain cannot be read ({exc})"
+    return None
+
+
 def workspace_box(manifest_path: str | None = None) -> Box | None:
     """The declared workspace, or None when the manifest declares none."""
     bounds = (((frontmatter(manifest_path).get("physics") or {}).get("workspace") or {})

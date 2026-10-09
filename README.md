@@ -146,7 +146,7 @@ same thing as a sentence, and may be reworded:
 | `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
 | `too_slow` | `speed` so small the move would take longer than 60 s |
 | `busy` | another command is running; commands are refused, not queued |
-| `manifest_unreadable` | the manifest's geometry could not be read, so nothing can be checked |
+| `manifest_unreadable` | the manifest's geometry could not be read, or does not declare a usable workspace and chain, so nothing can be checked |
 | `unreachable` | the links do not span it with the tool vertical |
 | `joint_limits` | solvable, but outside a joint's declared `limits_deg` |
 | `frame_disagreement` | the solve and forward kinematics disagree about where the pose puts the tip |
@@ -321,36 +321,55 @@ way back in; every setpoint is converted before the first is sent.
 
 **The stop interrupts, and holds without walking the arm down.** `arm.estop`
 latches before it waits for the bus, and a paced move checks the latch before
-every setpoint, so a move in progress ends within one period. While a stop waits
-for the bus, every other request is refused as `busy` at once (one that gets the
-bus first hands it straight back), and otherwise a request waits at most 1 s for
-the bus and is then refused: commands are not queued behind a running move.
-(robot-md-gateway runs stop tools on worker threads of their own, so a burst of
-other requests no longer holds the stop back waiting for a thread before it gets
-here. A flood that saturates the gateway's CPU still delays it: in simulation,
-with clients in other processes on two cores, the stop latched 0.9 s after it
-was sent under 120 looping clients and 4.7 s under 200, and with no other
-traffic in 0.05 s.)
+every setpoint, so a move in progress ends within one period. While the stop
+that latches waits for the bus, every other request is refused as `busy` at once
+(one that gets the bus first hands it straight back). A stop repeated while the
+arm is already stopped waits its turn like any other request, so a flood of
+stops cannot lock out `arm.estop.clear` or state reads. Otherwise a request
+waits at most 1 s for the bus and is then refused: commands are not queued
+behind a running move.
+
+robot-md-gateway runs stop tools on worker threads of their own, so a burst of
+other requests no longer holds the stop back waiting for a thread. CPU is
+another matter. In simulation, with the clients in other processes on two cores
+and a paced move running, the stop latched (and the move ended) 0.05 s after it
+was sent with no other traffic, 0.9 s under 120 looping clients (2.75 s
+before), and 4.7 s under 200; the hold went out about 0.9 s after the latch in
+both loaded cases. Under 45 clients it was no faster than before (0.87 s, was
+0.73 s): below the point where threads run out, the delay is CPU and the GIL,
+shared by every thread. The software stop is not the physical e-stop.
 
 The hold picks each joint's goal once per latch: the goal its servo is holding
 (read back from the servo's Goal_Position register), when the joint reads within
-100 ticks of it, so the stop moves nothing; otherwise where the joint is (it was
-moving, or it was pushed, or it is stalled against something). A repeated stop
-re-sends those goals for as long as the servo still holds them, however far the
-arm has sagged from them, and chooses again only for a joint whose servo no
+100 ticks of it, so the stop moves nothing; otherwise where the joint reads (it
+was moving, or it was pushed, or it is stalled far from its goal). A repeated
+stop re-sends those goals for as long as the servo still holds them, however far
+the arm has sagged from them, and chooses again only for a joint whose servo no
 longer does (a brown-out reset its goal to wherever it fell), from what that
-servo holds now. The stop used to re-read the encoders every time, and under
-gravity every repeat lowered the arm by its sag: 9 cm in 8 s of stops 0.2 s
-apart in simulation, and again, in review, for an arm sagging more than the 100
-ticks. Moves are planned from the same register for the same reason: planned
-from a stale copy, the first setpoint after a brown-out re-commanded the old
-goal in one unpaced jump.
+servo holds now. If the register cannot be read (twice), the stop falls back to
+a rule that needs no register: a joint within 100 ticks of the goal this latch
+chose keeps it, any other joint is held where it reads. The stop used to re-read
+the encoders every time, and under gravity every repeat lowered the arm by its
+sag: 9 cm in 8 s of stops 0.2 s apart in simulation. Moves are planned from the
+same register, and a move whose register read fails is refused rather than
+planned from the copy of what was last sent, which a brown-out may have made
+stale.
 
-One cost remains for an arm whose sag passes 100 ticks (about 9 degrees; five
-times bob's): the first stop cannot tell that sag from a stall, holds the joint
-where it reads, and the arm drops once by its sag (59 mm at the tip in
-simulation) before it holds. The register cannot tell the two apart; a load or
-speed reading could.
+What the 100-tick window costs, both ways:
+
+- A joint stalled within 100 ticks of its goal (8.8 degrees) keeps that goal
+  through a stop, so it keeps pushing on whatever stalled it, with close to its
+  stall torque at LeRobot's P gain. The software stop does not release a pinch.
+- An arm whose static sag passes 100 ticks (five times bob's) reads as moving,
+  so every fresh choice holds it where it reads and it drops by its sag: the
+  first stop of each latch, the first stop after every `arm.estop.clear`, and
+  the start of every move (59 mm at the tip per drop, in simulation). Within
+  one latch, repeated stops hold.
+
+`SO_ARM101_ADOPT_REFERENCE_TICKS` (0 to 1000) moves the window for such an
+arm, at the price of the first cost growing with it, and of a stop finishing up
+to that much of a move it did not pace (the castor-hal path's). The register
+cannot tell sag from a stall; a load or speed reading could.
 
 **`arm.reach_point` respects the workspace.** Targets less than the margin
 inside the box are refused (`out_of_workspace`), and every step it takes is a
@@ -369,8 +388,13 @@ neither evicts a process that opened the port first.
 Refusals of joint moves are now decisions, not faults: an unknown joint or a
 value outside a joint's limits comes back as a signed `403`
 (`unknown_joint`, `joint_limits`) rather than a `500`. A manifest whose geometry
-cannot be read refuses every motion (`manifest_unreadable`) instead of letting
-it through unchecked.
+cannot bound a motion refuses every motion (`manifest_unreadable`) instead of
+letting it through unchecked: a file that cannot be read, YAML that does not
+parse, no `physics.workspace.bounds_mm`, an axis that is not two numbers with
+the low one first (`z: [0]` used to read as "no floor"), or a chain that cannot
+be built. Declare every axis, as wide as you like. The check runs before every
+planned line, and a manifest re-signed in place is re-read, joint zeros and
+taught pose included (they used to stay as first read while the box moved on).
 
 **Not covered:** the castor-hal `Transport` path (`transport.py`,
 `make_hal_actuator`) still drives the raw `move()`: unpaced, unchecked and

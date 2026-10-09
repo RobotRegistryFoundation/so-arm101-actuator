@@ -41,15 +41,15 @@ nothing bounded speed.
   close the path came to a face and whether a stop ended it.
 - **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
   waits for the bus lock, a paced move checks the latch before every setpoint,
-  every other request gives way while a stop waits for the bus, and otherwise
-  waits at most 1 s before it is refused as `busy`. The hold re-sends the goals
+  every other request gives way while the latching stop waits for the bus, and
+  otherwise waits at most 1 s before it is refused as `busy`. The hold re-sends the goals
   it chose for this latch while the servos still hold them, instead of
   re-reading the sagged encoders on every repeat (which walked the arm down
   9 cm in 8 s in simulation); a joint whose servo no longer holds them (a reset)
   is chosen again from what it holds. Each goal is the one the servo's own
   Goal_Position register reports, when the joint reads within 100 ticks of it,
-  not its sag. An arm sagging more than 100 ticks drops by its sag once, on the
-  first stop.
+  not its sag. An arm sagging more than 100 ticks drops by its sag on each
+  fresh choice (see below).
 - **Moves plan from the servo's Goal_Position register**, not from a copy of
   the last goal sent: after a brown-out reset a goal, the stale copy made the
   first setpoint an unpaced jump back (1.5 m/s at the tip in simulation).
@@ -81,6 +81,17 @@ nothing bounded speed.
 - The serial handle is dropped under the bus lock, and the stop's latch is built
   under its own lock.
 - Not covered: the castor-hal `Transport` path still drives the raw `move()`.
+- Found by a third review, and fixed: a Goal_Position read that fails is
+  retried once and then fails the move (it used to fall back to the stale
+  copy); the stop then holds a joint within the window of its chosen goal and
+  any other where it reads. A workspace that parses but is malformed (`z: [0]`,
+  a misspelled key, low above high) refuses motion, checked before every
+  planned line. Only the stop that latches gets bus priority (four looping stop
+  clients used to lock out every clear). A manifest re-signed in place is
+  re-read, joint zeros included. `SO_ARM101_ADOPT_REFERENCE_TICKS` moves the
+  100-tick window. Documented, not fixed: a joint stalled within the window
+  keeps pushing through a stop, and an arm sagging past it drops by its sag on
+  every fresh choice (each latch, each clear, each move start).
 - The cost, in the same simulation: no excursion in 9 hostile ten-minute runs,
   but with the declared joint limits a benign tabletop task ran 64 of its 93
   moves (its stations 10 mm above the table were refused: the predicted series

@@ -686,14 +686,22 @@ def test_the_margin_override_narrows_or_widens_the_default(monkeypatch):
     assert act_mod.resolve_workspace_margin_mm() == 5.0
 
 
-@pytest.mark.parametrize("reply", [OSError("no reply"), True, -1, 4096, 2048.0, None])
-def test_a_goal_register_that_cannot_answer_is_unknown_not_a_fault(reply):
+@pytest.mark.parametrize("reply", [True, -1, 4096, 2048.0, None])
+def test_a_goal_register_reply_that_is_not_a_position_is_unknown(reply):
     proto = MagicMock()
-    if isinstance(reply, Exception):
-        proto.read_goal_position.side_effect = reply
-    else:
-        proto.read_goal_position.return_value = reply
+    proto.read_goal_position.return_value = reply
     assert SOArm101Actuator(protocol=proto)._read_goal_register("shoulder_lift") is None
+
+
+def test_a_goal_register_read_that_fails_is_retried_once_then_raises():
+    """Found in the third review: a failed read used to read as "cannot say",
+    and the callers fell back to a copy a reset may have made stale."""
+    proto = MagicMock()
+    proto.read_goal_position.side_effect = [OSError("garbled"), 1990]
+    assert SOArm101Actuator(protocol=proto)._read_goal_register("shoulder_lift") == 1990
+    proto.read_goal_position.side_effect = OSError("no reply")
+    with pytest.raises(OSError):
+        SOArm101Actuator(protocol=proto)._read_goal_register("shoulder_lift")
 
 
 def test_a_bus_without_a_goal_register_plans_from_where_the_arm_reads():
@@ -923,3 +931,155 @@ def test_releasing_a_handle_is_best_effort():
 
     act_mod._release_serial(None)
     act_mod._release_serial(_Gone())                        # neither raises
+
+
+# --------------------------------------------------------------------------- #
+# Found by the third review
+# --------------------------------------------------------------------------- #
+
+class _DeafRegisterBus(_SaggingBus):
+    """Goal_Position reads fail: a servo that never answers them."""
+
+    def read_goal_position(self, motor_id):
+        raise OSError("no reply")
+
+
+def test_a_repeated_stop_with_a_failing_register_never_jumps_to_a_lost_goal():
+    """With the register unreadable, a repeated stop after a 350-tick reset
+    re-sent the old goal: the tip rose 250 mm at 1.1 m/s, out of the box."""
+    bus = _DeafRegisterBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    assert _estop(actuator).success
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    first = bus.goal[lift]
+    bus.goal[lift] = first - 350                 # the reset; the joint reads 362 ticks from the hold
+    bus.writes.clear()
+    assert _estop(actuator).success              # the stop itself does not fail on the read
+    assert (lift, first) not in bus.writes
+    assert (lift, first - 350 - bus.sag) in bus.writes      # held where it reads
+
+
+def test_a_repeated_stop_with_a_failing_register_keeps_a_hold_within_the_window():
+    bus = _DeafRegisterBus(sag=12)
+    actuator = SOArm101Actuator(protocol=bus)
+    _estop(actuator)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    first = bus.goal[lift]
+    for _ in range(20):
+        _estop(actuator)
+    assert bus.goal[lift] == first               # no ratchet within the window
+
+
+def test_a_move_with_a_failing_register_moves_nothing(fake_clock):
+    bus = _DeafRegisterBus()
+    actuator = SOArm101Actuator(protocol=bus)
+    outcome = actuator.execute(envelope={"tool_name": "move",
+                                         "tool_args": {"joint_positions": {"shoulder_pan": 0.1}}},
+                               manifest_path="", tier="actuate", config={})
+    assert outcome.outcome_kind == "error"
+    assert bus.writes == []
+
+
+_Z = "      z:\n        - 0\n        - 250\n"
+
+
+@pytest.mark.parametrize("broken", [
+    (_Z, "      z:\n        - 0\n"),
+    (_Z, "      z: '0..250'\n"),
+    (_Z, "      z:\n        - 250\n        - 0\n"),
+    (_Z, "      z:\n        - .nan\n        - 250\n"),
+    (_Z, "      zz:\n        - 0\n        - 250\n"),
+    ("  workspace:\n", "  workspce:\n"),
+    ("    bounds_mm:\n", "    bounds:\n"),
+])
+def test_a_workspace_declared_wrongly_refuses_motion(tmp_path, fake_clock, broken):
+    """Found in the third review: a manifest that parses but declares its
+    workspace wrongly read as "no limits", and a joint move took the tip 111 to
+    302 mm below the floor."""
+    old, new = broken
+    text = Path(M).read_text()
+    assert old in text, old
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(text.replace(old, new, 1))
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    outcome = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path=manifest, tier="actuate", config={})
+    assert outcome.telemetry.get("deny") == "manifest_unreadable", outcome
+    proto.set_position.assert_not_called()
+
+
+def test_the_fixture_workspace_is_declared_correctly():
+    from so_arm101_actuator import kinematics as kin
+
+    assert kin.geometry_problem(M) is None
+
+
+def test_a_line_planned_after_the_manifest_broke_is_refused(tmp_path, fake_clock):
+    """The door checks once per request; reach_point plans up to 25 lines."""
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(Path(M).read_text())
+    state, proto = _ready_arm()
+    actuator = SOArm101Actuator(protocol=proto)
+    actuator._apply_manifest(str(manifest))
+    manifest.write_text(Path(M).read_text().replace(_Z, "      z:\n        - 0\n", 1))
+    os.utime(manifest, (2, 2))
+    with pytest.raises(DeniedError) as exc:
+        actuator._move_checked({"shoulder_pan": 0.1}, speed=1.0, timeout_s=5.0)
+    assert exc.value.code == "manifest_unreadable"
+    proto.set_position.assert_not_called()
+
+
+def test_a_manifest_re_signed_in_place_is_reloaded(tmp_path):
+    """Found in the third review: the joint zeros stayed as first read while the
+    box and chain moved on, so motion was checked on a model 26 degrees off."""
+    text = Path(M).read_text()
+    marker = "zero_pose_steps: "
+    assert marker in text
+    manifest = tmp_path / "ROBOT.md"
+    manifest.write_text(text)
+    actuator = SOArm101Actuator(protocol=MagicMock())
+    actuator._apply_manifest(str(manifest))
+    before = {j: spec["tick_at_zero_rad"] for j, spec in config.JOINTS.items()}
+    assert marker + "2230" in text                        # shoulder_lift's zero
+    manifest.write_text(text.replace(marker + "2230", marker + "2530", 1))
+    os.utime(manifest, (3, 3))
+    actuator._apply_manifest(str(manifest))
+    after = {j: spec["tick_at_zero_rad"] for j, spec in config.JOINTS.items()}
+    assert after != before
+
+
+def test_only_the_stop_that_latches_goes_first(monkeypatch):
+    """Found in the third review: with every stop given priority, four looping
+    read-tier stop clients locked out every arm.estop.clear and state read."""
+    seen: list[bool] = []
+    real = act_mod._bus
+
+    def spy(timeout_s, *, stop=False):
+        seen.append(stop)
+        return real(timeout_s, stop=stop)
+
+    monkeypatch.setattr(act_mod, "_bus", spy)
+    actuator = SOArm101Actuator(protocol=_SaggingBus())
+    _estop(actuator)
+    _estop(actuator)
+    _estop(actuator)
+    assert seen == [True, False, False]
+
+
+@pytest.mark.parametrize("raw", ["many", "-1", "1001", "2.5"])
+def test_an_adoption_window_override_that_is_not_in_range_is_refused(monkeypatch, raw):
+    monkeypatch.setenv("SO_ARM101_ADOPT_REFERENCE_TICKS", raw)
+    with pytest.raises(ValueError, match="SO_ARM101_ADOPT_REFERENCE_TICKS"):
+        act_mod.resolve_adopt_ticks()
+
+
+def test_the_adoption_window_can_be_widened_for_a_heavier_arm(monkeypatch):
+    """At five times bob's sag (112 ticks) each fresh choice lowers the arm; a
+    window of 150 keeps the goal instead."""
+    monkeypatch.setenv("SO_ARM101_ADOPT_REFERENCE_TICKS", "150")
+    bus = _SaggingBus(sag=112)
+    actuator = SOArm101Actuator(protocol=bus)
+    lift = config.JOINTS["shoulder_lift"]["motor_id"]
+    _estop(actuator)
+    assert bus.goal[lift] == 2048
