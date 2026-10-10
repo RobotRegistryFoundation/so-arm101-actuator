@@ -6,6 +6,107 @@ All notable changes to `so-arm101-actuator`. Format loosely follows
 Entries before 0.3.0 are reconstructed from the git history — this file did not
 exist while they shipped.
 
+## [Unreleased]
+
+What EV-03 found when it ran this driver behind robot-md-gateway against a
+simulated servo bus with bob's calibration and gravity sag (October 2026), and
+the fixes. Configured to do real work, the tip went up to 13 mm below the
+declared floor: targets on the floor face were accepted, the sagging arm rested
+below them, and full-slew jumps overshot on the way. The driver's own receipts
+put the tip outside the workspace after 270 to 450 moves per ten-minute run, and
+nothing bounded speed.
+
+### Changed (behaviour)
+
+- **Every gateway motion is a checked, paced line** (`motion.py`). `arm.move_to`,
+  `arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move` go from the
+  pose the arm is held at to the goal along one joint-space line that is
+  checked against `physics.workspace.bounds_mm` at the elbow, wrist and tip,
+  as commanded and as the arm will really be (commanded + its current offset),
+  with a margin (`SO_ARM101_WORKSPACE_MARGIN_MM`, default 10 mm) kept per face
+  (a move leaving the band keeps half of it, or comes at most 1 mm closer and
+  never past the face, as planned, when it starts nearer than that; an arm past
+  a face may go 2 mm further on that face only, on its way back in; the taught
+  pose can be reached though it is inside the margin), and streamed as setpoints evenly spaced in
+  time, at most 20 ms apart and each sized so the step stays under the declared speed limits
+  (never catching up after a stall). New deny
+  codes: `path_leaves_workspace`, `too_slow`, `busy`, `manifest_unreadable`.
+  **No target closer than the margin to a face is accepted.**
+- **`speed` means the fraction of the declared limits.** 1.0 (the default) used
+  to be one direct Goal_Position command, which ran the servos at their own top
+  speed; it is now the manifest's limits: `safety.max_tool_velocity_ms` for the
+  tool point (0.25 m/s when undeclared; `max_linear_velocity_ms` can only lower
+  it) and `safety.max_joint_velocity_dps` per joint (90 deg/s when undeclared).
+  Moves take longer. The `waypoints` telemetry key is now the number
+  of setpoints streamed; a `motion` block reports the pacing, the limits, how
+  close the path came to a face and whether a stop ended it.
+- **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
+  waits for the bus lock, a paced move checks the latch before every setpoint,
+  every other request gives way while the latching stop waits for the bus, and
+  otherwise waits at most 1 s before it is refused as `busy`. The hold re-sends the goals
+  it chose for this latch while the servos still hold them, instead of
+  re-reading the sagged encoders on every repeat (which walked the arm down
+  9 cm in 8 s in simulation); a joint whose servo no longer holds them (a reset)
+  is chosen again from what it holds. Each goal is the one the servo's own
+  Goal_Position register reports, when the joint reads within 100 ticks of it,
+  not its sag. An arm sagging more than 100 ticks drops by its sag on each
+  fresh choice (see below).
+- **Moves plan from the servo's Goal_Position register**, not from a copy of
+  the last goal sent: after a brown-out reset a goal, the stale copy made the
+  first setpoint an unpaced jump back (1.5 m/s at the tip in simulation).
+- **`arm.reach_point`** refuses targets less than the margin inside the
+  workspace (`out_of_workspace`; it checked reach only and steered to
+  z = -101.7 mm), takes only checked, paced steps, runs under the bus lock and
+  opens the port itself (its first call on a fresh gateway was an HTTP 500).
+- **The servo bus is opened exclusively** (pyserial `exclusive=True` plus
+  `TIOCEXCL`), so another process's `open(2)` fails with `EBUSY` while the
+  driver holds it. New `claim(config)` and `close()`; robot-md-gateway calls
+  `claim()` at startup. A dropped handle is now released, not leaked.
+- A subnormal `speed` (5e-324) is refused as `too_slow` instead of raising
+  `OverflowError` (an HTTP 500).
+- An unknown joint or a joint value outside its limits is a signed refusal
+  (`unknown_joint`, `joint_limits`), not a 500. A bare `move` takes only
+  `joint_positions`, `speed` and `timeout_s`; the bare `move_to` alias is parsed
+  like `arm.move_to`.
+- A manifest whose geometry cannot be read refuses motion
+  (`manifest_unreadable`) instead of leaving every check resolving to nothing:
+  a path that cannot be read, no YAML frontmatter, frontmatter that does not
+  parse (one stray tab) or is not a mapping. Asked on every motion, so a
+  manifest that changes under a running gateway is caught too. Reads still
+  answer.
+- `arm.reach` (a pose derived from the taught one) no longer gets the taught
+  pose's allowance for sitting inside the margin. A refused `arm.reach_point`
+  step no longer says "Nothing was moved." when earlier steps did move.
+- A joint parked outside its configured range can be moved back in; every
+  setpoint is converted before the first is sent.
+- The serial handle is dropped under the bus lock, and the stop's latch is built
+  under its own lock.
+- Not covered: the castor-hal `Transport` path still drives the raw `move()`.
+- Found by a third review, and fixed: a Goal_Position read that fails is
+  retried once and then fails the move (it used to fall back to the stale
+  copy); the stop then holds a joint within the window of its chosen goal and
+  any other where it reads. A workspace that parses but is malformed (`z: [0]`,
+  a misspelled key, low above high) refuses motion, checked before every
+  planned line. Only the stop that latches gets bus priority (four looping stop
+  clients used to lock out every clear). A manifest re-signed in place is
+  re-read, joint zeros included. `SO_ARM101_ADOPT_REFERENCE_TICKS` moves the
+  100-tick window. Documented, not fixed: a joint stalled within the window
+  keeps pushing through a stop, and an arm sagging past it drops by its sag on
+  every fresh choice (each latch, each clear, each move start).
+- The cost, in the same simulation: no excursion in 9 hostile ten-minute runs,
+  but with the declared joint limits a benign tabletop task ran 64 of its 93
+  moves (its stations 10 mm above the table were refused: the predicted series
+  carries the offset from the station above, which over-predicts the sag there
+  by about 7 mm), and a task working 4 to 18 mm above the table ran none from
+  bob's ready pose (it sits in the margin band of x = 340, and each line out of
+  it swung toward that face).
+
+### Added
+
+- `kinematics.Chain` (fast forward kinematics for the elbow, wrist and tip),
+  `kinematics.Box` / `workspace_box`, `kinematics.declared_speed_limits`.
+- `protocol.SCSProtocol.read_goal_position`.
+
 ## [0.3.0]
 
 ### Added

@@ -58,9 +58,13 @@ Request to `POST /v1/invoke`:
 ```
 
 with `Authorization: Bearer <actuate-tier token>`. `speed` is optional and in
-(0, 1]; `x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
+(0, 1]: the fraction of the declared speed limits the move may use (see
+[Motion is checked and paced](#motion-is-checked-and-paced-v040)).
+`x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
 (`physics.solver.base_frame`: z up, x forward) and name the **tool tip**, not
-the wrist flange.
+the wrist flange. The envelope's `scope` must be an actuation scope
+(`MANIPULATE`, `ACTUATE`, `EXECUTE`, ...): robot-md-gateway refuses a motion
+tool under `OBSERVE`.
 
 Response (`200`):
 
@@ -80,13 +84,28 @@ Response (`200`):
       "wrist_roll": -0.21475731030398976
     },
     "eef_mm": {"x": 150.08, "y": 0.0, "z": 49.89},
-    "elapsed_s": 0.0338,
+    "elapsed_s": 2.71,
     "max_error_rad": 0.00076,
     "error_mm": 0.14,
     "target_mm": {"x": 150.0, "y": 0.0, "z": 50.0},
     "speed": 0.5,
-    "waypoints": 2,
-    "ik_provider": "inhouse-so-arm101"
+    "waypoints": 136,
+    "ik_provider": "inhouse-so-arm101",
+    "motion": {
+      "setpoints": 136,
+      "pace_period_s": 0.0199,
+      "planned_duration_s": 2.71,
+      "tool_speed_limit_mps": 0.125,
+      "joint_speed_limit_dps": 45.0,
+      "tool_path_mm": 264.9,
+      "path_min_clearance_mm": 7.05,
+      "path_closest": {"point": "tip", "series": "commanded", "fraction_of_path": 0.047,
+                       "face": "x<=340", "at_mm": [333.0, 38.1, 193.2]},
+      "workspace_margin_mm": 10.0,
+      "start_offset_rad": {},
+      "stopped_by_estop": false,
+      "notes": []
+    }
   },
   "attestation": "attested",
   "outcome": {"...": "the Ed25519-signed receipt"},
@@ -122,8 +141,12 @@ same thing as a sentence, and may be reworded:
 
 | `deny` | Meaning |
 |---|---|
-| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` outside (0, 1] |
+| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1] |
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
+| `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
+| `too_slow` | `speed` so small the move would take longer than 60 s |
+| `busy` | another command is running; commands are refused, not queued |
+| `manifest_unreadable` | the manifest's geometry could not be read, or does not declare a usable workspace and chain, so nothing can be checked |
 | `unreachable` | the links do not span it with the tool vertical |
 | `joint_limits` | solvable, but outside a joint's declared `limits_deg` |
 | `frame_disagreement` | the solve and forward kinematics disagree about where the pose puts the tip |
@@ -219,6 +242,164 @@ The gateway reads that file at start, so the change lands on its next restart.
 Listing them in the signed `ROBOT.md`'s `capabilities:` as well is a separate,
 deliberate operator act — re-signing a robot's root-of-trust document is not a
 side effect of a driver update.
+
+## Motion is checked and paced (v0.4.0)
+
+Every motion robot-md-gateway can ask this driver for (`arm.move_to`,
+`arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move`) is one
+straight line in joint space, from the pose the arm is being held at to the
+goal, and that line is checked and paced before anything is sent.
+
+**The whole path is checked, not its ends.** The line is sampled every
+0.005 rad (about 2 mm at full reach), and the elbow, the wrist and the tip are
+checked against `physics.workspace.bounds_mm` at every sample, face by face,
+twice: as commanded, and as the arm will really be (the commanded pose plus the
+offset the arm shows now: gravity sag, friction). Each must stay
+`SO_ARM101_WORKSPACE_MARGIN_MM` (default **10 mm**) from every face. That margin
+covers what neither series can see: the offset changing with the pose (bob's
+shoulder settles 2.5 to 27 encoder ticks past its goal depending on which way it
+arrived, several millimetres at the tip), servo lag and tick rounding.
+
+Starting closer than the margin, a point may come no closer to that face, unless
+the move takes it a full margin away, in which case it keeps half the margin
+on the way (or, starting closer than that, may come 1 mm closer than it started,
+never past the face as planned: the first millimetre of almost any line out of
+a pose points the tip a little the wrong way). An arm already past a face
+(pushed out, or parked badly) may go up to 2 mm further past that face, and no
+other, on a move that ends a full margin inside. The pose the operator taught
+(`arm.home`) may sit inside the margin; the path to it may come as close as the
+pose itself or half the margin, whichever is closer, less 1 mm, and the pose
+itself must be inside the box. A refusal is `path_leaves_workspace` with no
+motion.
+
+Inside the margin band the plan is all there is, and the plan can be beaten:
+when a move starts, each joint's friction flips to the other side of its goal,
+which the prediction (measured at rest) cannot see. In the review's probes
+(simulation, bob's sag and friction fit, a stiff servo), 4 of 41 moves out of
+bob's ready pose, which sits 1.6 mm from x = 340 once it sags, crossed that face
+by up to 0.8 mm. Do not teach a pose inside the margin: from a full margin
+inside, the same error stays inside the box.
+
+The margin has a cost: no target closer than 10 mm to a face is accepted, as
+commanded or as predicted. The prediction carries today's offset unchanged to
+the goal, and the real offset depends on the pose and on which way the arm
+arrives, so it can be wrong in either direction; the margin is there for the
+direction that matters. In EV-03's simulation (bob's sag model) it erred the
+safe way at the low stations of a tabletop task: carried down from the station
+30 mm above, the offset put the tip 3 mm above the table at a station commanded
+10 mm up, where the simulated arm settles 10.3 mm up, so those stations were
+refused at a 10 mm margin and at a 5 mm one. And bob's taught ready pose sits
+7.6 mm from the x = 340 face (1.6 mm as predicted), where many lines out of it
+start by swinging the tip 1 to 3 mm toward that face, so from ready some
+targets are refused until a move that swings the other way gets the arm out.
+An operator whose work needs the tool nearer a face can declare the face where
+the tool may really go, or lower the margin after measuring their own arm's
+offsets.
+
+**Speed is bounded.** The servos take Goal_Position and nothing else, so a
+speed limit is a stream of setpoints, at most 20 ms apart, sized so that
+neither the tool point nor any joint is asked to move faster than the declared
+limits: `safety.max_tool_velocity_ms` for the tool point (**0.25 m/s** when the
+manifest declares none, ISO 10218-1's reduced speed; the schema's
+`max_linear_velocity_ms`, documented for wheeled bases, can only lower it) and
+`safety.max_joint_velocity_dps` for each joint (**90 deg/s** when undeclared, so
+wrist_roll and the gripper, which do not move the tool point, are paced too).
+The stream is planned at 80 % of the limits, and each setpoint goes out at least
+one period after the last: after a stall the move takes longer, it never
+catches up. `speed` scales both limits.
+`speed` 1.0 (the default) used to mean one direct command, which ran the servos
+at their own top speed (270 deg/s and 1.6 m/s at the tip in EV-03's simulation);
+it now means "as fast as the manifest allows".
+
+**Moves start from the goal being held.** A joint within 100 encoder ticks of
+the goal it was last sent (or, on a fresh gateway, of its own Goal_Position
+register) is holding that goal, and the move starts there; planning from the
+sagged reading instead lowers the arm by its sag on every command. 100 ticks is
+almost four times bob's measured sag, room for a payload. A joint that starts
+outside its configured range may pass between that start and the range on its
+way back in; every setpoint is converted before the first is sent.
+
+**The stop interrupts, and holds without walking the arm down.** `arm.estop`
+latches before it waits for the bus, and a paced move checks the latch before
+every setpoint, so a move in progress ends within one period. While the stop
+that latches waits for the bus, every other request is refused as `busy` at once
+(one that gets the bus first hands it straight back). A stop repeated while the
+arm is already stopped waits its turn like any other request, so a flood of
+stops cannot lock out `arm.estop.clear` or state reads. Otherwise a request
+waits at most 1 s for the bus and is then refused: commands are not queued
+behind a running move.
+
+robot-md-gateway runs stop tools on worker threads of their own, so a burst of
+other requests no longer holds the stop back waiting for a thread. CPU is
+another matter. In simulation, with the clients in other processes on two cores
+and a paced move running, the stop latched (and the move ended) 0.05 s after it
+was sent with no other traffic, 0.9 s under 120 looping clients (2.75 s
+before), and 4.7 s under 200; the hold went out about 0.9 s after the latch in
+both loaded cases. Under 45 clients it was no faster than before (0.87 s, was
+0.73 s): below the point where threads run out, the delay is CPU and the GIL,
+shared by every thread. The software stop is not the physical e-stop.
+
+The hold picks each joint's goal once per latch: the goal its servo is holding
+(read back from the servo's Goal_Position register), when the joint reads within
+100 ticks of it, so the stop moves nothing; otherwise where the joint reads (it
+was moving, or it was pushed, or it is stalled far from its goal). A repeated
+stop re-sends those goals for as long as the servo still holds them, however far
+the arm has sagged from them, and chooses again only for a joint whose servo no
+longer does (a brown-out reset its goal to wherever it fell), from what that
+servo holds now. If the register cannot be read (twice), the stop falls back to
+a rule that needs no register: a joint within 100 ticks of the goal this latch
+chose keeps it, any other joint is held where it reads. The stop used to re-read
+the encoders every time, and under gravity every repeat lowered the arm by its
+sag: 9 cm in 8 s of stops 0.2 s apart in simulation. Moves are planned from the
+same register, and a move whose register read fails is refused rather than
+planned from the copy of what was last sent, which a brown-out may have made
+stale.
+
+What the 100-tick window costs, both ways:
+
+- A joint stalled within 100 ticks of its goal (8.8 degrees) keeps that goal
+  through a stop, so it keeps pushing on whatever stalled it, with close to its
+  stall torque at LeRobot's P gain. The software stop does not release a pinch.
+- An arm whose static sag passes 100 ticks (five times bob's) reads as moving,
+  so every fresh choice holds it where it reads and it drops by its sag: the
+  first stop of each latch, the first stop after every `arm.estop.clear`, and
+  the start of every move (59 mm at the tip per drop, in simulation). Within
+  one latch, repeated stops hold.
+
+`SO_ARM101_ADOPT_REFERENCE_TICKS` (0 to 1000) moves the window for such an
+arm, at the price of the first cost growing with it, and of a stop finishing up
+to that much of a move it did not pace (the castor-hal path's). The register
+cannot tell sag from a stall; a load or speed reading could.
+
+**`arm.reach_point` respects the workspace.** Targets less than the margin
+inside the box are refused (`out_of_workspace`), and every step it takes is a
+checked, paced move; a step the check refuses ends the call as a signed refusal
+that says how far it got. It used to check reach only, and steered the tip to
+z = -101.7 mm. It now runs under the bus lock and opens the port like every
+other motion; its first call on a fresh gateway used to be an HTTP 500.
+
+**The bus is held exclusively.** The port is opened with an `flock`
+(pyserial `exclusive=True`) and `TIOCEXCL`, so any other process's `open(2)`
+fails with `EBUSY` while the gateway holds it. LeRobot takes no lock, and
+drove bob's arm with the gateway running. robot-md-gateway calls `claim()` at
+startup so the port is held from the start. Neither lock binds root, and
+neither evicts a process that opened the port first.
+
+Refusals of joint moves are now decisions, not faults: an unknown joint or a
+value outside a joint's limits comes back as a signed `403`
+(`unknown_joint`, `joint_limits`) rather than a `500`. A manifest whose geometry
+cannot bound a motion refuses every motion (`manifest_unreadable`) instead of
+letting it through unchecked: a file that cannot be read, YAML that does not
+parse, no `physics.workspace.bounds_mm`, an axis that is not two numbers with
+the low one first (`z: [0]` used to read as "no floor"), or a chain that cannot
+be built. Declare every axis, as wide as you like. The check runs before every
+planned line, and a manifest re-signed in place is re-read, joint zeros and
+taught pose included (they used to stay as first read while the box moved on).
+
+**Not covered:** the castor-hal `Transport` path (`transport.py`,
+`make_hal_actuator`) still drives the raw `move()`: unpaced, unchecked and
+outside the bus lock. It is not the entry point the gateway uses; switching to
+it would bypass everything above.
 
 ## What this is
 

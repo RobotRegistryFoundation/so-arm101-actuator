@@ -92,3 +92,67 @@ def test_ping_returns_true_on_response():
     fake = FakeSerial(scripted_reads=[_status_ok(motor_id=2)])
     proto = SCSProtocol(serial=fake)
     assert proto.ping(motor_id=2) is True
+
+
+def test_read_goal_position_reads_the_setpoint_register():
+    """Goal_Position (0x2A) is what the servo is holding; Present_Position
+    (0x38) is where gravity has left it. A fresh gateway plans from the first."""
+    fake = FakeSerial(scripted_reads=[_status_with_data(motor_id=3, data=b"\x10\x08")])
+    proto = SCSProtocol(serial=fake)
+    assert proto.read_goal_position(motor_id=3) == 0x0810
+    assert fake.written == [_build_packet(motor_id=3, instruction=0x02, params=b"\x2a\x02")]
+
+
+@pytest.mark.parametrize("method", ["read_position", "read_goal_position"])
+def test_a_reply_without_the_header_is_a_protocol_error_not_a_position(method):
+    from so_arm101_actuator.errors import ProtocolError
+
+    fake = FakeSerial(scripted_reads=[b"\x00\x00\x02\x04\x00\x00\x08\xf1"])
+    proto = SCSProtocol(serial=fake)
+    with pytest.raises(ProtocolError):
+        getattr(proto, method)(motor_id=2)
+
+
+@pytest.mark.parametrize("method", ["read_position", "read_goal_position"])
+def test_a_short_reply_is_a_protocol_error_not_a_position(method):
+    from so_arm101_actuator.errors import ProtocolError
+
+    fake = FakeSerial(scripted_reads=[b"\xff\xff\x02"])
+    proto = SCSProtocol(serial=fake)
+    with pytest.raises(ProtocolError):
+        getattr(proto, method)(motor_id=2)
+
+
+def _reply(motor_id: int, data: bytes, *, error: int = 0, length: int | None = None,
+           checksum: int | None = None) -> bytes:
+    body = bytes([motor_id, len(data) + 2 if length is None else length, error]) + data
+    return b"\xff\xff" + body + bytes([(~sum(body)) & 0xFF if checksum is None else checksum])
+
+
+@pytest.mark.parametrize("method", ["read_position", "read_goal_position"])
+@pytest.mark.parametrize("reply", [
+    _reply(3, b"\x00\x08"),                      # another servo's answer
+    _reply(2, b"\x00\x08", checksum=0x00),       # corrupted
+    _reply(2, b"\x00\x08", length=0x05),         # not the reply to a 2-byte read
+], ids=["wrong servo", "bad checksum", "bad length"])
+def test_a_reply_that_is_not_this_servos_answer_is_refused(method, reply):
+    """A stale packet left in the buffer, another servo's reply or line noise
+    must not become a position: the goal read is a move's starting point and a
+    stop's hold (review of #7)."""
+    from so_arm101_actuator.errors import ProtocolError
+
+    proto = SCSProtocol(serial=FakeSerial(scripted_reads=[reply]))
+    with pytest.raises(ProtocolError):
+        getattr(proto, method)(motor_id=2)
+
+
+def test_the_goal_read_refuses_a_servo_reporting_an_error_and_the_position_read_does_not():
+    """The goal register is trusted as a plan's start and a stop's hold, so a
+    servo flagging overload or overheat there is refused. Present_Position is
+    still reported: a stop and a state read must not depend on a healthy servo."""
+    from so_arm101_actuator.errors import ProtocolError
+
+    flagged = _reply(2, b"\x00\x08", error=0x20)  # overload
+    assert SCSProtocol(serial=FakeSerial([flagged])).read_position(motor_id=2) == 0x0800
+    with pytest.raises(ProtocolError, match="flagged error 0x20"):
+        SCSProtocol(serial=FakeSerial([flagged])).read_goal_position(motor_id=2)

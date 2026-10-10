@@ -105,7 +105,7 @@ def _envelope(tool_name: str, tool_args: dict, manifest: str, *,
     }
 
 
-def test_arm_move_to_on_the_wire(client, monkeypatch):
+def test_arm_move_to_on_the_wire(client, monkeypatch, fake_clock):
     """The documented request and response for a move that executes."""
     monkeypatch.setenv("SO_ARM101_SAFE_RANGE_RAD",
                        '{"shoulder_lift": [-1.45, 1.0], "elbow_flex": [-0.19, 1.5],'
@@ -134,7 +134,15 @@ def test_arm_move_to_on_the_wire(client, monkeypatch):
     assert telemetry["eef_mm"]["x"] == pytest.approx(150.0, abs=0.5)
     assert telemetry["eef_mm"]["z"] == pytest.approx(50.0, abs=0.5)
     assert telemetry["speed"] == 0.5
-    assert telemetry["waypoints"] == 2
+    # Paced: a stream of setpoints under half the declared tool limit, and the
+    # receipt says how the move was paced and how close its path came to a face.
+    assert telemetry["waypoints"] == telemetry["motion"]["setpoints"] > 1
+    assert telemetry["motion"]["tool_speed_limit_mps"] == pytest.approx(0.125)
+    # This rig starts parked with every servo at mid-travel, which puts the tip
+    # past x = 340; the move is allowed because it ends well inside and never
+    # gets more than motion.RECOVERY_DIP_MM further out on the way.
+    assert telemetry["motion"]["path_min_clearance_mm"] is not None
+    assert telemetry["motion"]["path_closest"]["point"] in ("tip", "wrist", "elbow")
     assert telemetry["ik_provider"] == "inhouse-so-arm101"
     assert set(telemetry["final_positions"]) == {
         "shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll"}

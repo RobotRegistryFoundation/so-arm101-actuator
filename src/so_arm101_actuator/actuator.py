@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import math
+import os
 import threading
 import time
 from pathlib import Path
@@ -13,6 +15,7 @@ from robot_md_gateway.actuator import ActuatorOutcome
 from so_arm101_actuator import config
 from so_arm101_actuator import config as _config_module
 from so_arm101_actuator import kinematics as kin
+from so_arm101_actuator import motion
 from so_arm101_actuator.errors import (
     DeniedError,
     UnknownJointError,
@@ -21,21 +24,90 @@ from so_arm101_actuator.errors import (
 )
 
 
-#: Default `speed` for arm.move_to when the caller does not say. 1.0 is one
-#: direct position command, which is exactly what arm.home and arm.reach have
-#: always done — a slower default would quietly change how every existing
-#: motion on this arm behaves.
+#: Default `speed` for every motion the gateway can ask for: the fraction of the
+#: declared speed limits a move may use (see :func:`kinematics.declared_speed_limits`).
+#: 1.0 used to mean "one direct position command", which let the servos run at
+#: their own top speed (270 deg/s, the tip at 1.6 m/s, in EV-03's simulation).
+#: It now means "as fast as the manifest allows, and no faster".
 DEFAULT_SPEED = 1.0
 
-#: Most interpolation waypoints a single move_to will command. The bus is
-#: position-only, so "slower" is spelled as "more, smaller commands"; past a
-#: dozen the extra round-trips cost more time than the motion they pace.
-MAX_WAYPOINTS = 10
+#: How far inside the declared workspace every checked point of a move must stay,
+#: in millimetres (or no closer to a face than it started). It covers what the
+#: path check cannot see: friction changing the arm's offset from its setpoint
+#: while it moves (bob's shoulder settles 2.5 to 27 encoder ticks past its goal
+#: depending on which way it arrived, several millimetres at the tip), servo lag,
+#: and tick rounding. Override with SO_ARM101_WORKSPACE_MARGIN_MM.
+WORKSPACE_MARGIN_MM = 10.0
 
-#: How long an intermediate waypoint is given to settle. Deliberately short:
-#: waypoints are a pacing device, not targets to converge on, and the final
-#: command is the one that has to arrive.
-WAYPOINT_TIMEOUT_S = 1.5
+#: A joint within this many encoder ticks of the goal it was last sent is
+#: HOLDING that goal; the difference is gravity sag and friction. Moves are
+#: planned from that goal, and a stop re-sends it. Planning from, or holding at,
+#: the READING instead lowers the goal by the sag every time: the "sag ratchet"
+#: that took a gate out of its envelope in under six seconds on bob, and that
+#: walked this arm down 9 cm in 8 s under repeated stops. Bob's measured sag is
+#: up to 27 ticks unloaded; 100 (8.8 degrees) leaves room for a payload that
+#: triples it. Adopting the goal adds no motion of its own (the servo is already
+#: driving to it), so the bound only has to separate holding from a joint that
+#: was moved a long way by something else (a power cycle that reset the goal, a
+#: collapse), where the reading is the only honest start.
+ADOPT_REFERENCE_TICKS = 100
+
+#: How long a request waits for the servo bus before it is refused as busy. A
+#: paced move holds the bus for its whole stream, and every request queued
+#: behind it holds one of the gateway's worker threads; with no bound, a burst
+#: of polls took every thread and the stop could not get one to latch on (a
+#: 25 s move ran to the end with a stop sent at 5 s). Commands are refused, not
+#: queued, while the arm is busy.
+BUS_WAIT_S = 1.0
+
+#: How long the stop waits for the bus to hold the arm once it has latched. A
+#: paced move sees the latch and lets go within one pace period.
+STOP_BUS_WAIT_S = 5.0
+
+#: The joints the kinematic chain walks; the gripper is not one of them.
+ARM_JOINTS = ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll")
+
+
+def resolve_adopt_ticks() -> int:
+    """ADOPT_REFERENCE_TICKS, or SO_ARM101_ADOPT_REFERENCE_TICKS (0 to 1000).
+
+    An arm whose static sag passes the window drops by its sag each time a hold
+    or a move's start is chosen afresh, because a joint that far from its goal
+    reads as moving, stalled or pushed. Widening it for such an arm has a price:
+    a stop then keeps a goal up to that far away, so it finishes that much of a
+    move it did not pace (the castor-hal path's) and keeps pushing on a joint
+    stalled within it. Refused loudly when it is not a whole number in range.
+    """
+    import os
+
+    raw = os.environ.get("SO_ARM101_ADOPT_REFERENCE_TICKS")
+    if raw is None:
+        return ADOPT_REFERENCE_TICKS
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"SO_ARM101_ADOPT_REFERENCE_TICKS: invalid whole number {raw!r}") from exc
+    if not 0 <= value <= 1000:
+        raise ValueError(f"SO_ARM101_ADOPT_REFERENCE_TICKS: must be 0 to 1000, got {raw!r}")
+    return value
+
+
+def resolve_workspace_margin_mm() -> float:
+    """WORKSPACE_MARGIN_MM, or SO_ARM101_WORKSPACE_MARGIN_MM (a non-negative
+    number of millimetres). An unparseable or negative override is refused
+    loudly rather than read as zero: a typo must not remove the margin."""
+    import os
+
+    raw = os.environ.get("SO_ARM101_WORKSPACE_MARGIN_MM")
+    if raw is None:
+        return WORKSPACE_MARGIN_MM
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"SO_ARM101_WORKSPACE_MARGIN_MM: invalid number {raw!r}") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"SO_ARM101_WORKSPACE_MARGIN_MM: must be >= 0, got {raw!r}")
+    return value
 
 
 class MoveResult(TypedDict):
@@ -74,8 +146,11 @@ class MoveToResult(TypedDict):
     error_mm: float
     target_mm: dict[str, float]
     speed: float
+    #: Setpoints the move was streamed as, `pace_period_s` apart at most.
     waypoints: int
     ik_provider: str
+    #: How the move was paced and checked; see `_motion_telemetry`.
+    motion: dict
 
 
 class ArmState(TypedDict):
@@ -91,13 +166,30 @@ class ArmState(TypedDict):
 
 
 def _open_serial(port: str, baud: int, timeout: float = 0.1):
-    """Open the servo bus WITHOUT asserting DTR/RTS.
+    """Open the servo bus WITHOUT asserting DTR/RTS, and EXCLUSIVELY.
 
     pyserial raises both on open, which is exactly esptool's
     reset-into-download-mode sequence on an ESP32 native-USB CDC. If a port is
     ever mis-identified — and a LoRa dev board next to a robot arm is the common
     case, not the edge case — opening it should fail harmlessly rather than
     reboot the other device.
+
+    Exclusive, because the gateway is only an enforcement layer if nothing else
+    can talk to the servos. On bob, LeRobot drove the arm while the gateway was
+    running: any process of the same user could open the port and its
+    Goal_Position packets reached the bus. Two locks, because they stop
+    different things:
+
+      * pyserial ``exclusive=True`` takes an ``flock``. It refuses a second
+        opener that also asks for one, and nothing else.
+      * ``TIOCEXCL`` makes the kernel refuse every further ``open(2)`` of this
+        tty with ``EBUSY`` for any process without CAP_SYS_ADMIN, LeRobot
+        included, which takes no lock at all.
+
+    Both are released when the handle is closed (:func:`_release_serial`).
+    Neither binds root, and neither evicts a process that opened the port
+    BEFORE this one: that is why the gateway claims the bus at startup
+    (:meth:`SOArm101Actuator.claim`).
     """
     import serial
 
@@ -107,8 +199,43 @@ def _open_serial(port: str, baud: int, timeout: float = 0.1):
     handle.timeout = timeout
     handle.dtr = False
     handle.rts = False
+    handle.exclusive = True
     handle.open()
+    try:
+        _set_tty_exclusive(handle, True)
+    except OSError:
+        handle.close()
+        raise
     return handle
+
+
+def _set_tty_exclusive(handle, exclusive: bool) -> None:  # noqa: ANN001 — a serial.Serial
+    """TIOCEXCL / TIOCNXCL on the handle's descriptor. A no-op where termios has
+    neither (Windows), because there is no equivalent to fall back to."""
+    try:
+        import fcntl
+        import termios
+    except ImportError:
+        return
+    request = getattr(termios, "TIOCEXCL" if exclusive else "TIOCNXCL", None)
+    if request is not None:
+        fcntl.ioctl(handle.fileno(), request)
+
+
+def _release_serial(handle) -> None:  # noqa: ANN001 — a serial.Serial or None
+    """Give the bus back: drop TIOCEXCL, then close (which also drops the flock).
+    Best effort and idempotent: releasing a handle that is already gone is fine."""
+    if handle is None:
+        return
+    try:
+        if getattr(handle, "is_open", True):
+            _set_tty_exclusive(handle, False)
+    except Exception:  # noqa: BLE001 — no descriptor (a stand-in handle), or already closed
+        pass
+    try:
+        handle.close()
+    except Exception:  # noqa: BLE001 — a close that fails leaves nothing more to do
+        pass
 
 
 #: One servo bus, one caller at a time. The gateway serves /v1/invoke from a
@@ -117,6 +244,59 @@ def _open_serial(port: str, baud: int, timeout: float = 0.1):
 #: (reproduced 6/6). Mutual exclusion has to live here, at the device owner —
 #: rate-limiting one client cannot help when a second client exists.
 _BUS_LOCK = threading.Lock()
+
+#: Guards the lazy construction of the stop's latch (``_estop_transport``): two
+#: requests building it at once could latch one copy and consult the other.
+_TRANSPORT_LOCK = threading.Lock()
+
+
+#: How many stops are waiting for the bus right now. While any is, every other
+#: request gives way: Python's lock is not first-come-first-served, so a stream
+#: of polls could otherwise keep taking the bus ahead of a stop that is already
+#: latched but has not yet sent its hold (4 s late under 120 looping clients,
+#: found in review).
+_STOPS_WAITING = 0
+_STOPS_WAITING_LOCK = threading.Lock()
+
+
+def _busy() -> DeniedError:
+    return DeniedError(
+        "busy",
+        "the arm is carrying out another command, and commands are refused rather than "
+        "queued while it does. Try again when it has finished.")
+
+
+@contextlib.contextmanager
+def _bus(timeout_s: float, *, stop: bool = False):
+    """Hold the servo bus, or refuse as busy after ``timeout_s``.
+
+    ``stop=True`` goes first: while a stop waits, any other request that has
+    not got the bus is refused at once, and one that gets it hands it straight
+    back, so the stop needs only the request already holding the bus to finish
+    (a paced move ends at its next setpoint once the stop has latched).
+    """
+    global _STOPS_WAITING
+    if stop:
+        with _STOPS_WAITING_LOCK:
+            _STOPS_WAITING += 1
+        try:
+            acquired = _BUS_LOCK.acquire(timeout=timeout_s)
+        finally:
+            with _STOPS_WAITING_LOCK:
+                _STOPS_WAITING -= 1
+    else:
+        if _STOPS_WAITING:
+            raise _busy()
+        acquired = _BUS_LOCK.acquire(timeout=timeout_s)
+        if acquired and _STOPS_WAITING:
+            _BUS_LOCK.release()
+            raise _busy()
+    if not acquired:
+        raise _busy()
+    try:
+        yield
+    finally:
+        _BUS_LOCK.release()
 
 #: ROBOT.md capability names this driver can actually execute. Declared-but-
 #: unimplemented capabilities (arm.pick / arm.place need the vision rig and a
@@ -137,9 +317,10 @@ IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
 #: the telemetry the gateway signs, so nobody reads "e-stop" on a receipt and
 #: infers a hardware interlock that does not exist here.
 ESTOP_SAFETY_NOTE = (
-    "SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint to "
-    "its current encoder reading so motion stops) - NOT a hardware e-stop. The "
-    "SCS bus exposes no torque-off here, and software cannot guarantee the arm "
+    "SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent a "
+    "goal to hold: the goal it was holding, or where it reads if it was moving; "
+    "a repeated stop re-sends the same goals) - NOT a hardware e-stop. The SCS "
+    "bus exposes no torque-off here, and software cannot guarantee the arm "
     "physically stopped."
 )
 
@@ -215,11 +396,17 @@ def _denied(exc: DeniedError) -> ActuatorOutcome:
 def _parse_move_to_args(tool_args: dict) -> dict:
     """Validate `arm.move_to`'s wire arguments into keyword arguments.
 
+    ``execute`` has already refused a ``tool_args`` that is not an object;
+    this checks it again so a direct caller gets a refusal, not a TypeError.
+
     Strict on purpose. A missing coordinate is not zero, an unknown argument is
     not ignorable (a caller who wrote ``z`` instead of ``z_mm`` means to move
     somewhere, and silently dropping it moves the arm somewhere else), and a
     string "150" is a client that has not decided what its numbers are.
     """
+    if not isinstance(tool_args, dict):
+        raise DeniedError("bad_args",
+                          f"tool_args must be an object, got {type(tool_args).__name__}")
     coords: dict[str, float] = {}
     for name in ("x_mm", "y_mm", "z_mm"):
         if name not in tool_args:
@@ -243,10 +430,10 @@ def _parse_move_to_args(tool_args: dict) -> dict:
             f"y_mm, z_mm and an optional speed")
 
     speed = tool_args.get("speed", DEFAULT_SPEED)
-    # Validated here as well as in _waypoint_count so a malformed speed is
-    # refused before the serial port is opened.
-    SOArm101Actuator._waypoint_count(speed)
-    return {**coords, "speed": float(speed)}
+    # Validated here, before the serial port is opened, so a malformed speed
+    # costs nothing; a subnormal one is refused as too slow once the move's
+    # length is known.
+    return {**coords, "speed": motion.validate_speed(speed)}
 
 
 class SOArm101Actuator:
@@ -324,6 +511,16 @@ class SOArm101Actuator:
             self.move_tolerance_rad = env_tolerance
 
         self._protocol = protocol
+        #: Encoder ticks last commanded to each joint: the pose this actuator is
+        #: holding the arm at, which under load is not where the encoders say the
+        #: arm is. See ADOPT_REFERENCE_TICKS.
+        self._reference: dict[str, int] = {}
+        #: The ticks a latched stop is holding, chosen once per latch so that a
+        #: repeated stop re-sends them instead of re-reading a sagged pose.
+        self._held: dict[str, int] | None = None
+        #: (manifest path, why) when that manifest's geometry could not be read.
+        self._manifest_error: tuple[str, str] | None = None
+        self._manifest_stamp: float | None = None
 
     @classmethod
     def from_default_port(cls, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> "SOArm101Actuator":
@@ -331,6 +528,34 @@ class SOArm101Actuator:
         from so_arm101_actuator.protocol import SCSProtocol
         ser = _open_serial(port, baud)
         return cls(protocol=SCSProtocol(serial=ser))
+
+    def claim(self, config: dict | None = None) -> None:  # noqa: A002 — the gateway's name
+        """Claim the servo bus now, exclusively, and keep it until :meth:`close`.
+
+        The gateway calls this at startup with the actuator's config (``port``,
+        ``baud``) so the bus is held from the moment the service runs, not from
+        its first request: a bus nobody holds is a bus anybody can open, and
+        the exclusive open cannot evict a process that got there first. Raises
+        OSError (EBUSY when someone else holds the port).
+        """
+        cfg = config or {}
+        port = str(cfg.get("port", "/dev/ttyACM0"))
+        baud = int(cfg.get("baud", 1_000_000))
+        with _BUS_LOCK:
+            self._ensure_protocol(port=port, baud=baud)
+
+    def close(self) -> None:
+        """Release the servo bus (TIOCNXCL, flock, close). Idempotent."""
+        with _BUS_LOCK:
+            self._drop_protocol()
+
+    def _drop_protocol(self) -> None:
+        """Forget the protocol AND release its handle. Dropping the object
+        without closing it would leak the descriptor, and with it the exclusive
+        claim, so the re-open after a USB replug would fail with EBUSY against
+        this very process."""
+        proto, self._protocol = self._protocol, None
+        _release_serial(getattr(proto, "_serial", None))
 
     def _ensure_protocol(self, *, port: str = "/dev/ttyACM0", baud: int = 1_000_000) -> None:
         """Open the serial port if no protocol was injected at construction.
@@ -360,10 +585,7 @@ class SOArm101Actuator:
         # Issue commands.
         start = time.monotonic()
         for joint, rad in joint_positions.items():
-            self._protocol.set_position(
-                motor_id=config.JOINTS[joint]["motor_id"],
-                ticks=config.rad_to_ticks(joint, rad),
-            )
+            self._write_goal(joint, config.rad_to_ticks(joint, rad))
 
         # Poll until within tolerance or timeout.
         reached = False
@@ -405,6 +627,267 @@ class SOArm101Actuator:
         """Move all joints to the resolved home pose (env/kwarg-overridable)."""
         return self.move(self.home_pose_rad, timeout_s=timeout_s)
 
+    # ----------------------------------------------------------------- #
+    # Checked, paced motion: every motion the gateway can ask for
+    # ----------------------------------------------------------------- #
+
+    def _write_goal(self, joint: str, ticks: int) -> None:
+        """Command one joint and remember what it was told (the reference)."""
+        self._protocol.set_position(motor_id=config.JOINTS[joint]["motor_id"], ticks=ticks)
+        self._reference[joint] = int(ticks)
+
+    def _latched(self) -> bool:
+        """True while the software stop is latched. Read off the transport that
+        owns the latch, never copied: a second copy is a second thing to go stale."""
+        transport = getattr(self, "_transport", None)
+        return bool(transport is not None and transport._estopped)
+
+    def _planning_start(self, joints) -> tuple[dict[str, float], dict[str, float]]:  # noqa: ANN001
+        """Where a move starts, and how far the arm is from it, in radians.
+
+        A joint within ADOPT_REFERENCE_TICKS of the goal it was last sent is
+        holding that goal, and the move starts there; the reading's distance
+        from it (sag, friction) is the offset the path check adds to predict
+        where the arm will really be. Any other joint starts where it reads,
+        with no offset.
+        """
+        start: dict[str, float] = {}
+        offset: dict[str, float] = {}
+        for joint in joints:
+            present = int(self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"]))
+            held = self._holding_ticks(joint, present)
+            start[joint] = config.ticks_to_rad(joint, held)
+            offset[joint] = config.ticks_to_rad(joint, present) - start[joint]
+        return start, offset
+
+    def _holding_ticks(self, joint: str, present: int) -> int:
+        """The goal this joint is holding, if it is holding one; else where it reads.
+
+        The goal is the servo's own Goal_Position register: what it is really
+        aiming at. The copy this actuator kept of what it last sent is used
+        only when the servo cannot say. A brown-out can reset the register to
+        wherever the joint fell, and a move planned from the stale copy starts
+        by re-commanding it, in one unpaced jump (50 ticks at 1.5 m/s at the
+        tip, found in review in simulation).
+        """
+        return self._choose_hold(joint, present, self._read_goal_register(joint))
+
+    def _choose_hold(self, joint: str, present: int, register: int | None) -> int:
+        """The goal register if it is near the reading, else the reading. Falls
+        back to the copy of what was last sent only when the register is None."""
+        goal = register if register is not None else self._reference.get(joint)
+        return goal if goal is not None and abs(present - goal) <= resolve_adopt_ticks() else present
+
+    def _read_goal_register(self, joint: str) -> int | None:
+        """Goal_Position as the servo reports it; None when this bus has no such read.
+
+        A read that fails is tried once more, and a second failure raises: a
+        failed read is a bus fault like any other. It used to read as "cannot
+        say", and the callers then fell back to the copy of what was last sent,
+        which a brown-out may have made stale (review: a one-setpoint jump at
+        1.8 m/s, and a repeated stop that lifted the arm 250 mm).
+        """
+        reader = getattr(self._protocol, "read_goal_position", None)
+        if reader is None:
+            return None
+        motor = config.JOINTS[joint]["motor_id"]
+        try:
+            value = reader(motor_id=motor)
+        except Exception:  # noqa: BLE001 — one retry for a garbled reply; the second raises
+            value = reader(motor_id=motor)
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 4095:
+            return None
+        return value
+
+    def _chain(self) -> kin.Chain | None:
+        try:
+            return kin.Chain(self._manifest_applied)
+        except ValueError:
+            return None
+
+    def _move_checked(self, joint_positions: dict[str, float], *, speed: float = DEFAULT_SPEED,
+                      timeout_s: float = 5.0, hold: tuple[str, ...] = (),
+                      taught_goal: bool = False) -> dict:
+        """Move these joints along a checked, paced line, then wait for arrival.
+
+        The path from the pose the arm is being held at to the goal is checked
+        against the declared workspace (:func:`motion.check_line`) and paced
+        under the declared speed limits (:func:`motion.pace_line`) before
+        anything is sent; a refusal is a DeniedError and nothing moves. Joints
+        that are not in ``joint_positions`` are not commanded, but where they
+        are still counts toward the path check. Joints in ``hold`` are
+        commanded to stay where the move starts (their reference, or their
+        reading when they are not holding one) and are reported like the rest.
+
+        ``taught_goal`` is for the pose the operator taught (arm.home), which
+        may sit inside the workspace margin; see :func:`motion.check_line`.
+
+        Every setpoint is converted to ticks before the first one is sent, so a
+        conversion that fails cannot leave a move half-written. A joint that
+        starts outside its configured range may pass through values between
+        that start and the range on its way back in, and nowhere else.
+
+        The stream stops between setpoints if the software stop latches, and
+        the result says so.
+        """
+        for joint in joint_positions:
+            if joint not in config.JOINTS:
+                raise UnknownJointError(joint)
+        for joint, rad in joint_positions.items():
+            spec = config.JOINTS[joint]
+            if not isinstance(rad, (int, float)) or isinstance(rad, bool) or not math.isfinite(rad):
+                raise OutOfRangeError(f"{joint}={rad!r} is not a finite number")
+            if not (spec["min_rad"] <= rad <= spec["max_rad"]):
+                raise OutOfRangeError(f"{joint}={rad:.3f} outside [{spec['min_rad']}, {spec['max_rad']}]")
+        speed = motion.validate_speed(speed)
+
+        manifest = self._manifest_applied
+        # Asked again for every planned line, not only at the door: a manifest
+        # rewritten in place mid-call (reach_point plans up to 25) must not leave
+        # the next line planned against nothing.
+        if manifest:
+            problem = kin.geometry_problem(manifest)
+            if problem:
+                raise DeniedError(
+                    "manifest_unreadable",
+                    f"this robot's geometry could not be read from {manifest} ({problem}), "
+                    f"so no motion can be checked against it")
+        joints = list(dict.fromkeys([*ARM_JOINTS, *joint_positions, *hold]))
+        start, offset = self._planning_start(joints)
+        goal = {**start, **{j: float(v) for j, v in joint_positions.items()}}
+        plan = motion.plan(self._chain(), kin.workspace_box(manifest), start, goal,
+                           offset=offset, margin_mm=resolve_workspace_margin_mm(), speed=speed,
+                           limits=kin.declared_speed_limits(manifest), taught_goal=taught_goal)
+
+        commanded = {**{j: start[j] for j in hold}, **{j: goal[j] for j in joint_positions}}
+        ticks_plan = [[(j, self._ticks_on_path(j, setpoint[j], start[j])) for j in commanded]
+                      for setpoint in plan.setpoints]
+        started = time.monotonic()
+        completed = self._stream(ticks_plan, plan.step_s)
+        result = self._await_arrival(commanded, started=started, timeout_s=timeout_s,
+                                     interrupted=not completed)
+        result["motion"] = self._motion_telemetry(plan, offset, completed)
+        return result
+
+    @staticmethod
+    def _ticks_on_path(joint: str, rad: float, start_rad: float) -> int:
+        """Ticks for a setpoint on a checked line. Inside the joint's configured
+        range, or between an out-of-range start and that range; nowhere else."""
+        spec = config.JOINTS[joint]
+        low, high = min(spec["min_rad"], start_rad), max(spec["max_rad"], start_rad)
+        if not (low - 1e-9 <= rad <= high + 1e-9):
+            raise OutOfRangeError(
+                f"{joint}={rad:.3f} outside [{spec['min_rad']}, {spec['max_rad']}]")
+        ticks = int(round(spec["tick_at_zero_rad"] + rad * spec["ticks_per_rad"]))
+        return max(0, min(4095, ticks))
+
+    def _stream(self, ticks_plan: list[list[tuple[str, int]]], step_s: float) -> bool:
+        """Send each setpoint at least ``step_s`` after the one before. False if
+        the software stop latched before the last one went out.
+
+        Paced from the previous write, never against a schedule: after a stall
+        (a servo that misses a status packet costs a 0.1 s read timeout) a
+        schedule sends the overdue setpoints back to back, which ran the tool at
+        0.55 m/s against a 0.25 m/s limit. Late setpoints make the move longer,
+        never faster.
+        """
+        for setpoint in ticks_plan:
+            if self._latched():
+                return False
+            sent = time.monotonic()
+            for joint, ticks in setpoint:
+                self._write_goal(joint, ticks)
+            wait = sent + step_s - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+        return True
+
+    def _await_arrival(self, joint_positions: dict[str, float], *, started: float, timeout_s: float,
+                       interrupted: bool) -> dict:
+        """Poll until within tolerance or timeout, then report from ONE snapshot
+        (see the note in :meth:`move` on receipts that disagree with themselves)."""
+        deadline = time.monotonic() + timeout_s
+        while not interrupted and time.monotonic() < deadline and not self._latched():
+            current = {j: self._read_joint(j) for j in joint_positions}
+            if all(abs(current[j] - joint_positions[j]) <= self.move_tolerance_rad
+                   for j in joint_positions):
+                break
+            time.sleep(0.02)
+        final = {j: self._read_joint(j) for j in joint_positions}
+        errors = {j: abs(final[j] - joint_positions[j]) for j in joint_positions}
+        max_error = max(errors.values()) if errors else 0.0
+        return {
+            "reached": (not interrupted) and max_error <= self.move_tolerance_rad,
+            "final_positions": final,
+            "elapsed_s": time.monotonic() - started,
+            "max_error_rad": round(max_error, 5),
+        }
+
+    @staticmethod
+    def _motion_telemetry(plan: motion.Plan, offset: dict[str, float], completed: bool) -> dict:
+        """What the receipt says about how a move was paced and checked."""
+        return {
+            "setpoints": len(plan.setpoints),
+            "pace_period_s": round(plan.step_s, 4),
+            "planned_duration_s": round(plan.duration_s, 3),
+            "tool_speed_limit_mps": plan.tool_speed_limit_mps,
+            "joint_speed_limit_dps": plan.joint_speed_limit_dps,
+            "tool_path_mm": None if plan.tool_path_mm is None else round(plan.tool_path_mm, 1),
+            "path_min_clearance_mm": plan.min_clearance_mm,
+            "path_closest": plan.closest,
+            "workspace_margin_mm": resolve_workspace_margin_mm(),
+            "start_offset_rad": {j: round(v, 4) for j, v in offset.items() if v},
+            "stopped_by_estop": not completed,
+            "notes": plan.notes,
+        }
+
+    def _hold_pose(self) -> dict[str, int]:
+        """Hold every joint, and return the ticks held.
+
+        The first hold after the stop latches chooses each joint's goal: the
+        goal its servo is holding, when that is near where it reads (within
+        ADOPT_REFERENCE_TICKS; see :meth:`_holding_ticks`), so the stop moves
+        nothing; otherwise where it reads (it was moving, or it was pushed).
+
+        Every later hold re-sends those ticks for as long as the servo still
+        holds them, however far the arm has sagged from them. Re-anchoring to
+        the reading walks a loaded arm down by its sag on every stop: the
+        ratchet, 9 cm in 8 s of repeated stops in EV-03's simulation, and back
+        again in review for an arm whose sag passes the adoption window (at
+        five times bob's sag, z = 112 to -103 mm in ten stops). A joint whose
+        servo no longer holds them (a brown-out reset its goal to wherever it
+        fell) is chosen again from what it holds now: re-sending the old goal
+        would drive it back unpaced (40 mm at 0.38 m/s, in simulation).
+
+        When the register read fails (twice), the stop does not fail with it.
+        It falls back to the rule that needs no register, which bounds what a
+        stale goal can cost: a joint within the adoption window of the goal
+        this latch chose keeps it, any other joint is held where it reads.
+
+        A bus with no such read at all (a test double) is taken to still hold
+        what was sent: that cannot detect a reset, but it cannot ratchet.
+        """
+        window = resolve_adopt_ticks()
+        chosen: dict[str, int] = dict(self._held) if self._held is not None else {}
+        for joint, spec in config.JOINTS.items():
+            present = int(self._protocol.read_position(motor_id=spec["motor_id"]))
+            try:
+                register, failed = self._read_goal_register(joint), False
+            except Exception:  # noqa: BLE001 — the stop must not fail on a read
+                register, failed = None, True
+            kept = chosen.get(joint)
+            if failed:
+                chosen[joint] = (kept if kept is not None and abs(present - kept) <= window
+                                 else present)
+                continue
+            if kept is not None and (register is None or register == kept):
+                continue
+            chosen[joint] = self._choose_hold(joint, present, register)
+        self._held = chosen
+        for joint, ticks in chosen.items():
+            self._write_goal(joint, ticks)
+        return dict(chosen)
+
     def _apply_manifest(self, manifest_path) -> None:
         """Re-read geometry from a specific manifest, at most once per path.
 
@@ -413,8 +896,19 @@ class SOArm101Actuator:
         stays out of motion because its fallback zero is wrong for this arm.
         """
         key = str(manifest_path) if manifest_path else ""
-        if not key or key == getattr(self, "_manifest_applied", None):
+        if not key:
             return
+        # Keyed on the file's mtime as well as its path: a manifest re-signed in
+        # place used to keep its old joint zeros and taught pose here while the
+        # box, the chain and the limits (read through kinematics' own mtime-keyed
+        # cache) moved on, so motion was checked on a model up to the change off.
+        try:
+            stamp: float | None = os.path.getmtime(key)
+        except OSError:
+            stamp = None
+        if key == getattr(self, "_manifest_applied", None) and stamp == self._manifest_stamp:
+            return
+        self._manifest_stamp = stamp
         try:
             _config_module.apply_manifest_calibration(key)
             self._gripper_calibrated = _config_module.gripper_geometry_known(key)
@@ -425,8 +919,12 @@ class SOArm101Actuator:
                 pose = {**pose, **self._home_pose_override}
             self.home_pose_rad = pose
             self._manifest_applied = key
-        except Exception:
-            pass
+            self._manifest_error = None
+        except Exception as exc:  # noqa: BLE001 — recorded; motion refuses on it (see execute)
+            # Not fatal for reads. For motion it is: with the geometry unread the
+            # workspace, the chain and the limits resolve to nothing, and every
+            # move would go unchecked.
+            self._manifest_error = (key, f"{type(exc).__name__}: {exc}")
 
     def reach_point(self, target_mm, *, tolerance_mm: float = 5.0,
                     max_iterations: int = 25) -> dict:
@@ -450,9 +948,40 @@ class SOArm101Actuator:
         from so_arm101_actuator import kinematics as kin
 
         target = tuple(float(v) for v in target_mm)
+        if not all(math.isfinite(v) for v in target):
+            raise DeniedError("bad_args", f"target_mm must be three finite numbers, got {target_mm!r}")
         ok, why = kin.reachable(target, self._manifest_applied)
         if not ok:
             raise OutOfRangeError(why)
+        # The declared workspace, with the same margin every step's path is held
+        # to. Reach used to be the only check here, so the loop would steer the
+        # tip to any point the links could span, through the floor included.
+        box = kin.workspace_box(self._manifest_applied)
+        margin = resolve_workspace_margin_mm()
+        if box is not None and box.clearance(target) < margin:
+            raise DeniedError(
+                "out_of_workspace",
+                f"{list(target)} is {box.clearance(target):.1f} mm inside the declared workspace "
+                f"(face {box.nearest_face(target)}); a target must be at least {margin:g} mm inside.")
+
+        refused: dict[str, str] = {}
+
+        def _step(pose: dict[str, float]) -> str | None:
+            """One checked, paced move. Returns why it could not be made, or None."""
+            try:
+                result = self._move_checked(pose, timeout_s=3.0)
+            except DeniedError as exc:
+                refused.setdefault("code", exc.code)
+                # The check's own "Nothing was moved." is true of this step only;
+                # _give_up says what the call as a whole did.
+                detail = exc.detail.replace(" Nothing was moved.", "").rstrip()
+                return f"the next step was refused: {detail}"
+            except OutOfRangeError as exc:
+                refused.setdefault("code", "joint_limits")
+                return f"the next step was refused: {exc}"
+            if result["motion"]["stopped_by_estop"] or self._latched():
+                return "stopped by arm.estop"
+            return None
 
         history = []
         best_error = None
@@ -483,9 +1012,19 @@ class SOArm101Actuator:
             for joint, value in warm.items():
                 lo, hi = config.SAFE_RANGE_RAD.get(joint, (-3.14, 3.14))
                 safe[joint] = max(lo, min(hi, value))
-            self.move(safe, timeout_s=3.0)
-            self._settle(safe)
-            warm_started = True
+            # A warm start whose path the workspace check refuses is simply not
+            # taken: the loop below servos from where the arm is instead.
+            why = _step(safe)
+            if why == "stopped by arm.estop":
+                current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
+                return {"arrived": False, "error_mm": round(error_now, 2), "iterations": 0,
+                        "error_history": history, "warm_started": False, "stopped_because": why,
+                        "final_positions": current}
+            if why is None:
+                self._settle(safe)
+                warm_started = True
+            else:
+                refused.clear()   # a warm start that is refused is simply not taken
 
         # Static-error compensation. These servos hold a static error under
         # load (measured 2026-09-09: shoulder_lift sits 0.03-0.04 rad from where
@@ -507,16 +1046,24 @@ class SOArm101Actuator:
             # Walk back to the closest pose this loop measured before reporting
             # the miss, so a caller that reads the arm afterwards finds it at
             # its best, not wherever a diverging step left it.
-            if best_pose is not None and best_error is not None and best_error < error - 1.0:
+            if (best_pose is not None and best_error is not None and best_error < error - 1.0
+                    and not self._latched()):
                 back = {j: best_pose[j] for j in kin.REACH_JOINTS}
-                self.move(back, timeout_s=3.0)
-                self._settle(back)
+                if _step(back) is None:
+                    self._settle(back)
                 current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
                 error = kin.reach_step(current, target, manifest_path=self._manifest_applied)[1]
-            return {"arrived": False, "error_mm": round(error, 2),
-                    "iterations": step, "error_history": history,
-                    "warm_started": warm_started, "stopped_because": why,
-                    "final_positions": current}
+            out = {"arrived": False, "error_mm": round(error, 2),
+                   "iterations": step, "error_history": history,
+                   "warm_started": warm_started, "stopped_because": why,
+                   "final_positions": current}
+            if why.startswith("the next step was refused") and "code" in refused:
+                out["refused"] = refused["code"]
+                moved = step > 0 or warm_started
+                out["stopped_because"] = why + (
+                    " That step was not taken; the steps before it in this call did move the "
+                    "arm, to final_positions." if moved else " Nothing was moved.")
+            return out
 
         for step in range(max_iterations):
             current = {j: self._read_joint(j) for j in config.JOINTS if j != "gripper"}
@@ -576,7 +1123,9 @@ class SOArm101Actuator:
                 if safe[joint] != wanted:
                     pinned.add(joint)
             last_command = dict(safe)
-            self.move(safe, timeout_s=3.0)
+            why = _step(safe)
+            if why is not None:
+                return _give_up(step, error, current, why)
             # move() returns as soon as every joint is within move_tolerance_rad
             # (0.05 rad, 16 mm at the tip) of its target, which is BEFORE a small
             # step has visibly happened. Reading the pose then shows no progress,
@@ -629,12 +1178,19 @@ class SOArm101Actuator:
         ``unsafe_start``       the arm is parked outside that envelope, so no
                                straight line from here stays inside it
 
-        ``speed`` (0, 1] paces the motion. The servo bus this driver owns takes
-        Goal_Position and nothing else — there is no velocity register in
-        ``protocol.py`` and adding one is a hardware change, not a software one
-        — so speed is spelled as joint-space interpolation: ``ceil(1/speed)``
-        waypoints along the straight line from here to there. 1.0 is one direct
-        command, exactly what every other motion on this arm already does.
+        ``path_leaves_workspace`` the line from here to there passes within
+                               the margin of a face (or past it)
+        ``too_slow``           `speed` so small the move would outlast
+                               motion.MAX_MOVE_S
+
+        ``speed`` (0, 1] is the fraction of the declared speed limits the move
+        may use: the tool point's (``safety.max_tool_velocity_ms``, or 0.25
+        m/s when the manifest declares none; ``max_linear_velocity_ms`` can
+        only lower it, see kinematics.declared_speed_limits) and each joint's
+        (``safety.max_joint_velocity_dps``). The servo bus this driver owns takes
+        Goal_Position and nothing else, so a speed limit is a stream of small
+        setpoints (motion.PACE_PERIOD_S apart), each sized so the tool cannot be
+        asked to move faster than the limit.
         """
         manifest = self._manifest_applied
         target = (float(x_mm), float(y_mm), float(z_mm))
@@ -699,25 +1255,23 @@ class SOArm101Actuator:
                     f"its measured safe range [{lo:+.2f}, {hi:+.2f}] — no straight "
                     f"path from here stays inside the envelope. Run arm.home first.")
 
+        # 6 and 7. The PATH, not just its ends: the joint-space line from the
+        #    pose the arm is held at to this solution is checked against the
+        #    declared workspace at the elbow, wrist and tip, as commanded and as
+        #    the arm will really be (``path_leaves_workspace``), and paced under
+        #    the declared speed limits (``too_slow`` when `speed` is so small the
+        #    move would outlast motion.MAX_MOVE_S). Both endpoints inside the box
+        #    used to be taken as proof the path was too, the target was checked
+        #    only as commanded (not as the sagging arm would really sit), and the
+        #    move was one full-slew jump: EV-03 found the tip up to 13 mm below
+        #    the floor in simulation.
+        #
         # wrist_roll is HELD, not solved: it turns about the tool axis, which is
         # the axis every remaining link offset lies along, so it moves the tip by
         # exactly nothing. Commanding it to some fresh value would spin whatever
         # is in the gripper for no reason.
-        pose = dict(solution.joints)
-        pose["wrist_roll"] = current["wrist_roll"]
-
-        waypoints = self._waypoint_count(speed)
-        for index in range(1, waypoints):
-            fraction = index / waypoints
-            step = {joint: current[joint] + (pose[joint] - current[joint]) * fraction
-                    for joint in pose}
-            # Intermediate poses are a pacing device, not destinations — their
-            # `reached` verdict is deliberately ignored. Both endpoints are
-            # inside the safe box and the box is convex, so every point on this
-            # line is too.
-            self.move(step, timeout_s=WAYPOINT_TIMEOUT_S)
-
-        result = self.move(pose, timeout_s=timeout_s)
+        result = self._move_checked(dict(solution.joints), speed=speed, timeout_s=timeout_s,
+                                    hold=("wrist_roll",))
         final = result["final_positions"]
         tip = kin.tip_position_mm(final, manifest)
 
@@ -730,28 +1284,10 @@ class SOArm101Actuator:
             error_mm=round(math.dist(tip, target), 2),
             target_mm={"x": target[0], "y": target[1], "z": target[2]},
             speed=float(speed),
-            waypoints=waypoints,
+            waypoints=result["motion"]["setpoints"],
             ik_provider=solution.provider,
+            motion=result["motion"],
         )
-
-    @staticmethod
-    def _waypoint_count(speed: float) -> int:
-        """How many commands to split the path into for this speed.
-
-        Validated, never clamped: a speed of 0 means "do not move", which is not
-        a slower move but a different request, and 1.5 is a caller who thinks
-        this scale means something it does not.
-        """
-        if isinstance(speed, bool) or not isinstance(speed, (int, float)):
-            raise DeniedError("bad_args", f"speed must be a number, got {speed!r}")
-        value = float(speed)
-        if not (0.0 < value <= 1.0):
-            raise DeniedError(
-                "bad_args",
-                f"speed must be greater than 0 and at most 1, got {value}")
-        if value >= 1.0:
-            return 1
-        return min(MAX_WAYPOINTS, math.ceil(1.0 / value))
 
     def state(self) -> ArmState:
         """Where every joint is, where that puts the tip, and what is on it.
@@ -827,7 +1363,7 @@ class SOArm101Actuator:
         time.sleep(min_dwell_s)
         deadline = time.monotonic() + max_wait_s
         last = {j: self._read_joint(j) for j in commanded}
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not self._latched():
             time.sleep(poll_s)
             now = {j: self._read_joint(j) for j in commanded}
             on_target = all(abs(now[j] - commanded[j]) <= still_rad for j in commanded)
@@ -852,10 +1388,13 @@ class SOArm101Actuator:
         """
         transport = getattr(self, "_transport", None)
         if transport is None:
-            from so_arm101_actuator.transport import SOArm101Transport
+            with _TRANSPORT_LOCK:
+                transport = getattr(self, "_transport", None)
+                if transport is None:
+                    from so_arm101_actuator.transport import SOArm101Transport
 
-            transport = SOArm101Transport(actuator=self, port=port, baud=baud)
-            self._transport = transport
+                    transport = SOArm101Transport(actuator=self, port=port, baud=baud)
+                    self._transport = transport
         return transport
 
     def execute(
@@ -915,23 +1454,32 @@ class SOArm101Actuator:
         # must not reach the bus at all, and a stop must not depend on any of
         # the geometry the motion tools need to be correct.
         #
-        # SAFETY: ``estop()`` is a best-effort SOFTWARE hold (command each joint
-        # to its current encoder reading so motion stops) - NOT a hardware
-        # e-stop. The SCS bus exposes no torque-off here, and software cannot
-        # guarantee the arm physically stopped.
+        # SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent
+        # a goal to hold, chosen once per latch; see ESTOP_SAFETY_NOTE) - NOT a
+        # hardware e-stop. The SCS bus exposes no torque-off here, and software
+        # cannot guarantee the arm physically stopped.
         if tool_name == "arm.estop":
             transport = self._estop_transport(port=port, baud=baud)
+            # LATCH FIRST, outside the bus lock. A paced move holds that lock for
+            # its whole stream and checks this latch before every setpoint, so
+            # setting it here is what stops a move in progress within one pace
+            # period. Waiting for the lock first would let the move finish.
+            already = bool(transport._estopped)
+            transport._estopped = True
             held: dict[str, float] = {}
             try:
                 # Same lock every move takes: the hold writes a setpoint per
                 # joint, and a read interleaved into that sequence corrupts both.
-                with _BUS_LOCK:
+                # A move in progress lets go within one pace period of the latch.
+                # The stop that latches goes first: while it waits, every other
+                # request gives way. A stop repeated while already latched (there
+                # is nothing moving to stop) waits its turn like anything else:
+                # given priority, four looping read-tier stop clients locked
+                # every arm.estop.clear and state read out (found in review).
+                with _bus(STOP_BUS_WAIT_S, stop=not already):
                     transport.estop()
-                    for joint in _config_module.JOINTS:
-                        try:
-                            held[joint] = self._read_joint(joint)
-                        except Exception:  # noqa: BLE001 - evidence, not control flow
-                            pass
+                    held = {joint: _config_module.ticks_to_rad(joint, ticks)
+                            for joint, ticks in (self._held or {}).items()}
             except Exception as exc:  # noqa: BLE001 - the latch is already set
                 # estop() latches BEFORE it touches the bus, so a link that is
                 # down leaves this arm refusing motion rather than movable. The
@@ -947,13 +1495,21 @@ class SOArm101Actuator:
                 outcome_kind="executed",
                 telemetry={
                     "estopped": True,
+                    # The goals the stop is holding. Repeating the stop re-sends
+                    # exactly these; it never re-reads a sagged pose.
                     "held_positions": held,
                     "safety_note": ESTOP_SAFETY_NOTE,
                 },
             )
         if tool_name == "arm.estop.clear":
             transport = self._estop_transport(port=port, baud=baud)
-            transport.clear_estop()
+            try:
+                # Under the bus lock, so a clear cannot interleave with a stop
+                # that is still choosing what to hold.
+                with _bus(STOP_BUS_WAIT_S):
+                    transport.clear_estop()
+            except DeniedError as exc:
+                return _denied(exc)
             return ActuatorOutcome(
                 success=True,
                 outcome_kind="executed",
@@ -963,6 +1519,15 @@ class SOArm101Actuator:
                     "note": "cleared; the arm holds its pose until commanded",
                 },
             )
+        # Every tool below reads its arguments as an object. A signed request
+        # whose tool_args is a number, a string or a list is a bad argument
+        # and gets a signed refusal, not an AttributeError or TypeError out of
+        # execute (a 500). The stops above ignore their arguments, so no
+        # malformed argument can refuse a stop.
+        if not isinstance(tool_args, dict):
+            return _denied(DeniedError(
+                "bad_args",
+                f"tool_args must be an object, got {type(tool_args).__name__}"))
         if tool_name in MOTION_CAPABILITIES:
             # `_estopped` is the transport's own latch - read, never copied. A
             # second copy of this flag is a second thing that can be stale, and
@@ -973,26 +1538,75 @@ class SOArm101Actuator:
                     f"arm is e-stopped; {tool_name!r} is refused until "
                     "arm.estop.clear is invoked at the commission tier",
                 ))
+            # Fail closed on geometry. A manifest whose geometry could not be
+            # read leaves the workspace, the chain and the limits resolving to
+            # nothing, and the move would go unchecked.
+            # Asked on every motion, not once per path: the file can change under
+            # a running gateway (a re-signed manifest), and a YAML error or a
+            # malformed workspace reads as "no limits" everywhere else.
+            key = str(manifest_path) if manifest_path else ""
+            if key:
+                problem = (self._manifest_error[1]
+                           if self._manifest_error is not None and self._manifest_error[0] == key
+                           else kin.geometry_problem(key))
+                if problem:
+                    return _denied(DeniedError(
+                        "manifest_unreadable",
+                        f"this robot's geometry could not be read from {key} ({problem}), "
+                        f"so no motion can be checked against it"))
 
         # ROBOT.md / iOS capability names -> RAP methods. arm.pick / arm.place
         # stay unmapped: they need the vision rig, and the gateway deny-lists
         # them via ROBOT_MD_TOOL_ALLOWLIST so clients get a signed DENY instead.
-        if tool_name == "arm.home":
+        taught = False
+        if tool_name in ("arm.home", "home"):
             pose = self._home_pose_for_motion()
-            tool_name, tool_args = "move", {"joint_positions": pose}
+            tool_name, tool_args, taught = "move", {"joint_positions": pose}, True
         elif tool_name == "arm.reach_point":
             target = tool_args.get("target_mm")
-            if not target or len(target) != 3:
-                return ActuatorOutcome(
-                    success=False, outcome_kind="error",
-                    error_message="arm.reach_point needs target_mm as [x, y, z]")
+            if (not isinstance(target, (list, tuple)) or len(target) != 3
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in target)):
+                return _denied(DeniedError(
+                    "bad_args", "arm.reach_point needs target_mm as [x, y, z], three numbers"))
+            tolerance = tool_args.get("tolerance_mm", 5.0)
+            if (isinstance(tolerance, bool) or not isinstance(tolerance, (int, float))
+                    or not math.isfinite(tolerance) or tolerance <= 0):
+                return _denied(DeniedError(
+                    "bad_args", f"tolerance_mm must be a positive number, got {tolerance!r}"))
+            # The warm-start table is arithmetic (seconds of it on a Pi, the
+            # first time). Build it before taking the bus, not while holding it.
             try:
-                telemetry = self.reach_point(
-                    target,
-                    tolerance_mm=float(tool_args.get("tolerance_mm", 5.0)))
-            except Exception as exc:
+                kin._safe_table(self._manifest_applied, config.SAFE_RANGE_RAD)
+            except Exception:  # noqa: BLE001 — reach_point falls back to a cold start
+                pass
+            try:
+                # The same lock and lazy open as every other motion. reach_point
+                # used to run outside both: on a fresh gateway (no protocol open
+                # yet) it failed with a 500, and it could interleave its bus
+                # traffic with another request's.
+                with _bus(BUS_WAIT_S):
+                    try:
+                        self._ensure_protocol(port=port, baud=baud)
+                        telemetry = self.reach_point(target, tolerance_mm=float(tolerance))
+                    except (OSError, IOError) as exc:
+                        self._drop_protocol()       # under the lock, never beside another request
+                        return ActuatorOutcome(success=False, outcome_kind="error",
+                                               error_message=f"{type(exc).__name__}: {exc}")
+            except DeniedError as exc:
+                return _denied(exc)
+            except OutOfRangeError as exc:
+                return _denied(DeniedError("unreachable", str(exc)))
+            except Exception as exc:  # noqa: BLE001 — exceptions become outcomes
                 return ActuatorOutcome(success=False, outcome_kind="error",
                                        error_message=f"{type(exc).__name__}: {exc}")
+            if telemetry.get("refused"):
+                # A step the workspace check refused is a decision, like any
+                # other refusal: a signed 403 that carries how far it got.
+                return ActuatorOutcome(
+                    success=False, outcome_kind="denied",
+                    telemetry={**telemetry, "deny": telemetry["refused"],
+                               "reason": telemetry.get("stopped_because")},
+                    error_message=f"{telemetry['refused']}: {telemetry.get('stopped_because')}")
             return ActuatorOutcome(
                 success=bool(telemetry.get("arrived")),
                 outcome_kind="executed" if telemetry.get("arrived") else "error",
@@ -1002,10 +1616,11 @@ class SOArm101Actuator:
                     f"(final error {telemetry.get('error_mm')} mm, "
                     f"history {telemetry.get('error_history')}, "
                     f"warm_started={telemetry.get('warm_started')})"))
-        elif tool_name == "arm.move_to":
+        elif tool_name in ("arm.move_to", "move_to"):
             # Argument shape is settled BEFORE the bus is opened: a malformed
             # request should not cost a serial handle, and it must come back as
-            # a deny rather than as a driver crash.
+            # a deny rather than as a driver crash. The bare `move_to` alias is
+            # parsed the same way; it used to skip this and take any timeout_s.
             try:
                 tool_args = _parse_move_to_args(tool_args)
             except DeniedError as exc:
@@ -1025,10 +1640,28 @@ class SOArm101Actuator:
                 )
             reach_pose = self._home_pose_for_motion()
             reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
+            # Derived from the taught pose, not taught itself: it gets no
+            # allowance for sitting inside the margin.
             tool_name, tool_args = "move", {"joint_positions": reach_pose}
+        if tool_name == "move":
+            # Every joint move the gateway can ask for (arm.home, arm.reach, a
+            # bare `move`) is checked against the workspace and paced, exactly
+            # like arm.move_to. `move()` itself stays the raw primitive it was.
+            unknown = sorted(set(tool_args) - {"joint_positions", "speed", "timeout_s"})
+            joints = tool_args.get("joint_positions")
+            timeout = tool_args.get("timeout_s", 10.0)
+            if (unknown or not isinstance(joints, dict) or isinstance(timeout, bool)
+                    or not isinstance(timeout, (int, float)) or not 0 < timeout <= 60):
+                return _denied(DeniedError(
+                    "bad_args", "move takes joint_positions ({joint: radians}), an optional speed "
+                                "and an optional timeout_s (0 to 60 s)"
+                                + (f"; not {', '.join(unknown)}" if unknown else "")))
+            tool_args = {"joint_positions": joints,
+                         "speed": tool_args.get("speed", DEFAULT_SPEED),
+                         "timeout_s": float(timeout),
+                         "taught_goal": taught}
         method = {
-            "move": self.move,
-            "home": self.home,
+            "move": self._move_checked,
             "read_state": self.read_state,
             "move_to": self.move_to,
             "state": self.state,
@@ -1042,24 +1675,34 @@ class SOArm101Actuator:
         try:
             # Held across open AND the whole operation: a move polls the bus
             # repeatedly until it converges, and a read slipped in between
-            # those polls corrupts both.
-            with _BUS_LOCK:
-                self._ensure_protocol(port=port, baud=baud)
-                result = method(**tool_args)
+            # those polls corrupts both. Waited for only briefly (BUS_WAIT_S):
+            # a request queued behind a long move holds a gateway thread the
+            # stop may need.
+            with _bus(BUS_WAIT_S):
+                try:
+                    self._ensure_protocol(port=port, baud=baud)
+                    result = method(**tool_args)
+                except (OSError, IOError) as exc:
+                    # The serial handle is held for the process lifetime, so a
+                    # USB replug leaves a dead fd that would fail every later
+                    # invoke. Drop it (and release its exclusive claim) so the
+                    # next invoke re-opens by-id instead of needing a restart,
+                    # and do it while still holding the bus: dropping it after
+                    # letting go closed the handle under the next request.
+                    self._drop_protocol()
+                    return ActuatorOutcome(
+                        success=False,
+                        outcome_kind="error",
+                        error_message=f"{type(exc).__name__}: {exc}",
+                    )
         except DeniedError as exc:
             # A refusal is a decision. It leaves the bus untouched and reaches
             # the caller as a signed 403, not as a 500 that reads like a fault.
             return _denied(exc)
-        except (OSError, IOError) as exc:
-            # The serial handle is held for the process lifetime, so a USB
-            # replug leaves a dead fd that would fail every later invoke. Drop
-            # it so the next invoke re-opens by-id instead of needing a restart.
-            self._protocol = None
-            return ActuatorOutcome(
-                success=False,
-                outcome_kind="error",
-                error_message=f"{type(exc).__name__}: {exc}",
-            )
+        except UnknownJointError as exc:
+            return _denied(DeniedError("unknown_joint", f"no joint named {exc.args[0]!r} on this arm"))
+        except OutOfRangeError as exc:
+            return _denied(DeniedError("joint_limits", str(exc)))
         except Exception as exc:  # noqa: BLE001 — actuator code is operator-supplied; exceptions become outcomes
             return ActuatorOutcome(
                 success=False,

@@ -67,3 +67,40 @@ class FakeSerial:
 
     def close(self) -> None:
         pass
+
+
+class FakeClock:
+    """Stands in for ``time`` inside the actuator module: ``sleep`` advances the
+    clock instead of waiting. Every gateway-facing motion is now a paced stream
+    of setpoints a fixed period apart, and over a perfect simulated servo there
+    is nothing to wait for but the pacing itself."""
+
+    def __init__(self) -> None:
+        import time as _time
+
+        self._time = _time
+        self.now = 1_000.0
+        self.slept = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    perf_counter = monotonic
+
+    def sleep(self, seconds: float) -> None:
+        if seconds and seconds > 0:
+            self.now += seconds
+            self.slept += seconds
+
+    def __getattr__(self, name):
+        return getattr(self._time, name)
+
+
+@pytest.fixture
+def fake_clock(monkeypatch):
+    """Opt in per test: tests that time a real servo stand-in keep real time."""
+    import so_arm101_actuator.actuator as act
+
+    clock = FakeClock()
+    monkeypatch.setattr(act, "time", clock)
+    return clock
