@@ -14,10 +14,13 @@ actuator.move({"shoulder_pan": 0.3})
 print(actuator.read_state())
 ```
 
-The castor-hal Transport adapter (`so_arm101_actuator.transport`) is optional:
-`pip install "so-arm101-actuator[hal]"`, after installing
-[castor-hal](https://github.com/RobotRegistryFoundation/castor-hal), which is
-not on PyPI yet. It reads and stops the arm and moves nothing (see
+The castor-hal Transport adapter (`so_arm101_actuator.transport`) is optional.
+It needs [castor-hal](https://github.com/RobotRegistryFoundation/castor-hal),
+which is not on PyPI, so install it from its repository:
+`pip install "castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal"`.
+This package names no castor-hal extra: an extra naming an unclaimed PyPI
+project would install whatever is later published under that name. The adapter
+reads and stops the arm and moves nothing (see
 [the castor-hal adapter](#the-castor-hal-adapter-moves-nothing)).
 robot-md-gateway's `so-arm101` entry point does not need it.
 
@@ -409,12 +412,19 @@ taught pose included (they used to stay as first read while the box moved on).
 The castor-hal `Transport` adapter (`transport.py`, `make_hal_actuator`) used to
 drive the raw `move()`: unpaced, unchecked and outside the bus lock, bypassing
 everything above. It now declares no goal kinds and refuses every `set_goal` as
-`unsupported_goal` before the bus is touched. It still reads the arm, and stops
-it through the actuator's own latch, so a stop through either path refuses the
-gateway path's motion. It is not the entry point the gateway uses, and it needs
-the optional `hal` extra. Moving the arm through it again would mean sending its
-goals through the checked, paced path, which needs the manifest that path checks
-against; the `Transport` seam does not carry one.
+`unsupported_goal` before any servo traffic (castor-hal's `TransportActuator`
+still opens the port before it dispatches). It still reads the arm, and stops it
+through the wrapped actuator's own latch. That latch belongs to one
+`SOArm101Actuator` instance: a stop through the adapter refuses the gateway
+path's motion only when the adapter wraps the gateway's own instance
+(`SOArm101Transport(actuator=...)`). `make_hal_actuator` builds an instance of
+its own, so its stop does not block the gateway, and on real hardware it cannot
+open the port while the gateway holds it. The adapter's `clear_estop` takes the
+bus lock, as the gateway's `arm.estop.clear` does. It is not the entry point the
+gateway uses, and it needs castor-hal installed from its repository. Moving the
+arm through it again would mean sending its goals through the checked, paced
+path, which needs the manifest that path checks against; the `Transport` seam
+does not carry one.
 
 ## What this is
 

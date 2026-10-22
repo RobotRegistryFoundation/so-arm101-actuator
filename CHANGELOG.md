@@ -16,11 +16,12 @@ optional. 0.2.3 was never published; its changes reach PyPI here too.
 
 ### castor-hal is optional
 
-- **castor-hal is an extra (`hal`), no longer a dependency.** It is not on
-  PyPI, so a release that required it could not have been installed from PyPI.
-  The robot-md-gateway entry point imports nothing from it. To use the
-  Transport adapter, install castor-hal from its repository, then
-  `so-arm101-actuator[hal]`.
+- **castor-hal is no longer a dependency, and there is no castor-hal extra.**
+  It is not on PyPI, so a release that required it could not have been
+  installed from PyPI, and an extra naming it would install whatever is later
+  published under that name. The robot-md-gateway entry point imports nothing
+  from it. To use the Transport adapter, install castor-hal from its
+  repository first.
 - **The stop's latch no longer lives in the castor-hal adapter.** `arm.estop`
   used `transport.SOArm101Transport` as its latch, so with castor-hal absent the
   stop raised ModuleNotFoundError before it latched, and so did every motion,
@@ -29,10 +30,13 @@ optional. 0.2.3 was never published; its changes reach PyPI here too.
 - **The castor-hal adapter moves nothing.** `SOArm101Transport.set_goal` drove
   the raw `move()` and `home()`: unchecked, unpaced and outside the bus lock,
   past every fix below. It now declares no goal kinds and refuses every goal as
-  `unsupported_goal` before the bus is touched (out-of-range and unknown-joint
+  `unsupported_goal` before any servo traffic (out-of-range and unknown-joint
   goals, which were `out_of_range` and `unknown_target`, get the same refusal).
-  It still reads the arm, and stops it through the actuator's own latch, so the
-  two paths always agree on whether the arm is stopped.
+  It still reads the arm, and stops it through the wrapped actuator's own latch.
+  The two paths share that latch only when the adapter wraps the gateway's own
+  actuator instance; `make_hal_actuator` builds its own, with a latch of its
+  own. The adapter's `clear_estop` now takes the bus lock, as the gateway's
+  `arm.estop.clear` does.
 
 ### What EV-03 found, and the fixes
 

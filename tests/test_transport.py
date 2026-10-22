@@ -1,6 +1,6 @@
 """SOArm101Transport — the castor-hal adapter (mocked protocol; no hardware).
 
-castor-hal is an optional extra, so this module is skipped without it. The
+castor-hal is optional (installed from its repository), so this module is skipped without it. The
 adapter reads and stops the arm and moves nothing: its set_goal used to drive
 the raw move(), unchecked and unpaced (EV-03), so every goal is now refused
 before the bus is touched. Its stop is the wrapped actuator's own latch."""
@@ -12,7 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-pytest.importorskip("castor_hal", reason="castor-hal is the optional `hal` extra")
+pytest.importorskip("castor_hal", reason="castor-hal is optional and not installed")
 
 from castor_hal.actuator import TransportActuator  # noqa: E402
 from castor_hal.errors import TransportError, TransportErrorCode  # noqa: E402
@@ -88,9 +88,10 @@ def test_estop_holds_and_latches():
 
 
 def test_the_stop_is_the_wrapped_actuators_own_latch():
-    """One latch, never two copies that can disagree: a stop through the adapter
-    refuses the gateway path's motion, and a stop through the gateway path shows
-    here."""
+    """When the adapter wraps the actuator instance the gateway path uses, there
+    is one latch, never two copies that can disagree: a stop through the adapter
+    refuses that instance's motion, and a stop through it shows here. (A second
+    instance, such as make_hal_actuator builds, has a latch of its own.)"""
     t, _ = _make_transport()
     actuator = t._actuator
 
@@ -106,6 +107,39 @@ def test_the_stop_is_the_wrapped_actuators_own_latch():
                                manifest_path="", tier="read", config={})
     assert stopped.success is True
     assert t._estopped is True
+
+
+def test_clear_waits_for_the_bus_and_leaves_the_latch_set_while_it_is_busy(monkeypatch):
+    """The adapter's clear takes the bus lock, as the gateway's arm.estop.clear
+    does, so it cannot clear the shared latch while a stop still holds the bus."""
+    import threading
+
+    import so_arm101_actuator.actuator as act
+    import so_arm101_actuator.transport as tr
+
+    monkeypatch.setattr(tr, "STOP_BUS_WAIT_S", 0.05)
+    t, _ = _make_transport()
+    t.estop()
+    held, release = threading.Event(), threading.Event()
+
+    def hold_the_bus():
+        with act._bus(5.0):
+            held.set()
+            release.wait(5.0)
+
+    holder = threading.Thread(target=hold_the_bus)
+    holder.start()
+    try:
+        assert held.wait(5.0)
+        with pytest.raises(TransportError) as err:
+            t.clear_estop()
+        assert err.value.code == TransportErrorCode.TIMEOUT
+        assert t._estopped is True                  # still latched
+    finally:
+        release.set()
+        holder.join(5.0)
+    t.clear_estop()                                 # the bus is free again
+    assert t._estopped is False
 
 
 # -- end-to-end through the gateway bridge ---------------------------------

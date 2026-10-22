@@ -5,8 +5,9 @@ This wraps the existing, tested ``SOArm101Actuator`` (serial bus servos via
 can be read and stopped through ``castor_hal.TransportActuator`` (see
 ``make_hal_actuator``). It is not the entry point robot-md-gateway uses: that is
 ``SOArm101Actuator`` itself, which needs nothing from castor-hal. This module
-does, and castor-hal is an optional extra: ``pip install
-"so-arm101-actuator[hal]"``.
+does: install castor-hal from its repository first
+(``pip install "castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal"``).
+castor-hal is not on PyPI, so this package names no castor-hal extra.
 
 It moves nothing. ``set_goal`` used to drive the actuator's raw ``move()`` and
 ``home()``: one Goal_Position jump per joint, not checked against the declared
@@ -17,8 +18,12 @@ gateway path (October 2026) was bypassed here. It now accepts no goals:
 paced path instead would need the manifest that path checks against, which the
 ``Transport`` seam does not carry.
 
-The stop is the wrapped actuator's own latch (``_estop_transport``), shared, so
-this adapter and the gateway path always agree on whether the arm is stopped.
+The stop uses the wrapped actuator's own latch (``_estop_transport``). The latch
+belongs to one ``SOArm101Actuator`` instance, so this adapter and the gateway
+path share it only when the adapter wraps the gateway's own instance
+(``SOArm101Transport(actuator=...)``). ``make_hal_actuator`` and ``from_config``
+build an instance of their own: a stop through them does not block the gateway's
+motion, and on real hardware it cannot open the port while the gateway holds it.
 
 SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent a goal
 to hold: the goal it was holding, or where it reads if it was moving; a repeated
@@ -33,19 +38,19 @@ try:
     from castor_hal.errors import TransportError, TransportErrorCode
     from castor_hal.state import TransportState
     from castor_hal.transport import GoalResult, Transport
-except ModuleNotFoundError as exc:  # castor-hal is the optional `hal` extra
+except ModuleNotFoundError as exc:  # castor-hal is optional and not on PyPI
     if exc.name != "castor_hal":
         raise
     raise ModuleNotFoundError(
         "so_arm101_actuator.transport is the castor-hal adapter, and castor-hal is "
-        "not installed. It is an optional extra: pip install 'so-arm101-actuator[hal]' "
-        "(castor-hal is not on PyPI yet; install it from "
-        "https://github.com/RobotRegistryFoundation/castor-hal first). The "
-        "robot-md-gateway entry point, SOArm101Actuator, does not need it.",
+        "not installed. It is not on PyPI; install it from its repository: "
+        "pip install 'castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal'. "
+        "The robot-md-gateway entry point, SOArm101Actuator, does not need it.",
         name="castor_hal",
     ) from exc
 
-from so_arm101_actuator.actuator import SOArm101Actuator, _StopLatch
+from so_arm101_actuator.actuator import STOP_BUS_WAIT_S, SOArm101Actuator, _bus, _StopLatch
+from so_arm101_actuator.errors import DeniedError
 
 
 class SOArm101Transport(Transport):
@@ -159,8 +164,9 @@ class SOArm101Transport(Transport):
     def estop(self) -> None:
         """Best-effort SOFTWARE hold (NOT a hardware e-stop — see module note).
         Holds each joint (``SOArm101Actuator._hold_pose``) so motion stops, and
-        latches the wrapped actuator's own stop (cleared via ``clear_estop``),
-        so the gateway path refuses motion too.
+        latches the wrapped actuator's own stop (cleared via ``clear_estop``).
+        The gateway path refuses motion too only when it uses that same actuator
+        instance (see the module note).
 
         What is held is chosen once per latch: the goal a joint was last sent
         when it is holding that goal, otherwise where it reads. A repeated stop
@@ -173,7 +179,12 @@ class SOArm101Transport(Transport):
         so if the link is down (``open`` raises) or the hold cannot be sent, the
         arm stays e-stopped and refuses new motion (``clear_estop`` + retry to
         recover), rather than silently accepting motion after a stop we
-        couldn't confirm. We fail toward stopped, never toward movable."""
+        couldn't confirm. We fail toward stopped, never toward movable.
+
+        That holds when this method is called. castor-hal's ``TransportActuator``
+        calls ``open()`` before it dispatches, so if the port cannot be opened
+        the stop fails as ``not_connected`` before this method runs, and nothing
+        latches."""
         self._latch()._estopped = True
         self.open()
         try:
@@ -185,9 +196,20 @@ class SOArm101Transport(Transport):
 
     def clear_estop(self) -> None:
         """Release the latched software e-stop (the wrapped actuator's own) so
-        motion can be commanded again through the gateway path. The arm keeps
-        holding its pose; the next stop chooses its hold afresh."""
-        self._latch().clear_estop()
+        motion can be commanded again. The arm keeps holding its pose; the next
+        stop chooses its hold afresh.
+
+        Under the bus lock, as the gateway's ``arm.estop.clear`` takes it, so a
+        clear cannot interleave with a stop that is still choosing or sending
+        its hold. If the bus stays busy for ``STOP_BUS_WAIT_S``, the latch stays
+        set and this raises ``timeout``."""
+        try:
+            with _bus(STOP_BUS_WAIT_S):
+                self._latch().clear_estop()
+        except DeniedError as exc:
+            raise TransportError(
+                TransportErrorCode.TIMEOUT, f"e-stop not cleared: {exc}"
+            ) from exc
 
 
 def make_hal_actuator(config_dict: dict | None = None):

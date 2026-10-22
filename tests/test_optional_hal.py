@@ -86,7 +86,7 @@ assert not [m for m in sys.modules if m == "castor_hal" or m.startswith("castor_
 try:
     import so_arm101_actuator.transport  # noqa: F401
 except ModuleNotFoundError as exc:
-    assert "so-arm101-actuator[hal]" in str(exc), exc
+    assert "git+https://github.com/RobotRegistryFoundation/castor-hal" in str(exc), exc
 else:
     raise AssertionError("the castor-hal adapter imported without castor-hal")
 print("ok")
@@ -102,9 +102,12 @@ def test_the_gateway_entry_point_runs_without_castor_hal():
     assert run.returncode == 0 and run.stdout.strip().endswith("ok"), run.stderr or run.stdout
 
 
-def test_castor_hal_is_an_extra_not_a_dependency():
+def test_castor_hal_is_neither_a_dependency_nor_an_extra():
+    """castor-hal is not on PyPI. Naming it, even in an extra, would let whoever
+    registers the name there install code onto the machine that drives the arm."""
     tomllib = pytest.importorskip("tomllib")            # Python 3.11+
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
-    assert not [d for d in project["dependencies"]
-                if d.lower().replace("_", "-").startswith("castor-hal")]
-    assert project["optional-dependencies"]["hal"] == ["castor-hal>=0.1"]
+    named = list(project["dependencies"])
+    for extra in project.get("optional-dependencies", {}).values():
+        named += extra
+    assert not [d for d in named if d.lower().replace("_", "-").startswith("castor-hal")]

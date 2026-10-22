@@ -20,10 +20,11 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
-# The castor-hal Transport adapter (so_arm101_actuator.transport), which reads and
-# stops the arm and moves nothing. The robot-md-gateway entry point does not need
-# it. castor-hal is not on PyPI yet: install it from its repository first.
-hal = ["castor-hal>=0.1"]
+# No castor-hal extra. The castor-hal Transport adapter (so_arm101_actuator.transport),
+# which reads and stops the arm and moves nothing, needs castor-hal installed from
+# its repository. castor-hal is not on PyPI, and an extra naming an unclaimed PyPI
+# project would install whatever is later published under that name onto the
+# machine that drives the arm. The robot-md-gateway entry point does not need it.
 
 [project.entry-points."robot_md_gateway.actuators"]
 so-arm101 = "so_arm101_actuator.actuator:SOArm101Actuator"
