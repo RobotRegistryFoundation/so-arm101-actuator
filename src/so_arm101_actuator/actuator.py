@@ -75,8 +75,9 @@ def resolve_adopt_ticks() -> int:
     or a move's start is chosen afresh, because a joint that far from its goal
     reads as moving, stalled or pushed. Widening it for such an arm has a price:
     a stop then keeps a goal up to that far away, so it finishes that much of a
-    move it did not pace (the castor-hal path's) and keeps pushing on a joint
-    stalled within it. Refused loudly when it is not a whole number in range.
+    move it did not pace (a direct call to the raw ``move()``) and keeps pushing
+    on a joint stalled within it. Refused loudly when it is not a whole number
+    in range.
     """
     import os
 
@@ -297,6 +298,46 @@ def _bus(timeout_s: float, *, stop: bool = False):
         yield
     finally:
         _BUS_LOCK.release()
+
+
+class _StopLatch:
+    """The arm's software stop: the latch every motion consults, and its hold.
+
+    One per actuator, built by :meth:`SOArm101Actuator._estop_transport`. It
+    used to be the castor-hal adapter (``transport.SOArm101Transport``), which
+    put castor-hal on the stop's path: with castor-hal not installed, the stop
+    raised ModuleNotFoundError before it latched, and so did every motion,
+    which consults the latch first. This is the same latch and the same hold
+    with nothing from castor-hal in it; the adapter now shares this one.
+
+    SAFETY: a best-effort SOFTWARE hold, NOT a hardware e-stop (see
+    ESTOP_SAFETY_NOTE).
+    """
+
+    def __init__(self, actuator: SOArm101Actuator, *, port: str, baud: int) -> None:
+        self._actuator = actuator
+        self._port = port
+        self._baud = baud
+        #: The latch: read where it is needed, never copied.
+        self._estopped = False
+
+    def estop(self) -> None:
+        """Latch FIRST, then hold every joint (``SOArm101Actuator._hold_pose``).
+
+        If the port cannot be opened or the hold cannot be sent, the latch stays
+        set and motion stays refused until it is cleared: fail toward stopped,
+        never toward movable. The caller holds the bus.
+        """
+        self._estopped = True
+        self._actuator._ensure_protocol(port=self._port, baud=self._baud)
+        self._actuator._hold_pose()
+
+    def clear_estop(self) -> None:
+        """Release the latch so motion can be commanded again. The arm keeps
+        holding its pose; the next stop chooses its hold afresh."""
+        self._estopped = False
+        self._actuator._held = None
+
 
 #: ROBOT.md capability names this driver can actually execute. Declared-but-
 #: unimplemented capabilities (arm.pick / arm.place need the vision rig and a
@@ -637,8 +678,9 @@ class SOArm101Actuator:
         self._reference[joint] = int(ticks)
 
     def _latched(self) -> bool:
-        """True while the software stop is latched. Read off the transport that
-        owns the latch, never copied: a second copy is a second thing to go stale."""
+        """True while the software stop is latched. Read off the latch itself
+        (``_estop_transport``), never copied: a second copy is a second thing to
+        go stale."""
         transport = getattr(self, "_transport", None)
         return bool(transport is not None and transport._estopped)
 
@@ -1376,24 +1418,24 @@ class SOArm101Actuator:
         ticks = self._protocol.read_position(motor_id=config.JOINTS[joint]["motor_id"])
         return config.ticks_to_rad(joint, ticks)
 
-    def _estop_transport(self, *, port: str, baud: int):
+    def _estop_transport(self, *, port: str, baud: int) -> _StopLatch:
         """The latch that owns this arm's stop, built once and kept.
 
-        The latch lives in ``SOArm101Transport`` (written, tested, and until now
-        unreachable). It is wrapped around THIS actuator instance rather than a
-        fresh one, so the two share a single ``_protocol`` and a single serial
-        handle - a second transport would mean a second open port and a latch
-        that the motion path never consults. Built lazily and cached, because
-        the latch state has to survive from the stop to the next request.
+        A :class:`_StopLatch`. The name is historical: the latch used to live
+        in the castor-hal adapter, ``SOArm101Transport``, which made the stop
+        depend on castor-hal being installed. The adapter now shares this latch
+        when it wraps this actuator. It is built around THIS actuator instance,
+        so the stop shares its single ``_protocol`` and serial handle - a
+        second handle would mean a second open port and a latch that the motion
+        path never consults. Built lazily and cached, because the latch state
+        has to survive from the stop to the next request.
         """
         transport = getattr(self, "_transport", None)
         if transport is None:
             with _TRANSPORT_LOCK:
                 transport = getattr(self, "_transport", None)
                 if transport is None:
-                    from so_arm101_actuator.transport import SOArm101Transport
-
-                    transport = SOArm101Transport(actuator=self, port=port, baud=baud)
+                    transport = _StopLatch(self, port=port, baud=baud)
                     self._transport = transport
         return transport
 
@@ -1529,9 +1571,8 @@ class SOArm101Actuator:
                 "bad_args",
                 f"tool_args must be an object, got {type(tool_args).__name__}"))
         if tool_name in MOTION_CAPABILITIES:
-            # `_estopped` is the transport's own latch - read, never copied. A
-            # second copy of this flag is a second thing that can be stale, and
-            # the one in transport.py is the one ``set_goal`` already obeys.
+            # `_estopped` is the stop latch's own flag - read, never copied. A
+            # second copy of this flag is a second thing that can be stale.
             if self._estop_transport(port=port, baud=baud)._estopped:
                 return _denied(DeniedError(
                     "estop_latched",

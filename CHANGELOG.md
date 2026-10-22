@@ -81,7 +81,9 @@ nothing bounded speed.
   setpoint is converted before the first is sent.
 - The serial handle is dropped under the bus lock, and the stop's latch is built
   under its own lock.
-- Not covered: the castor-hal `Transport` path still drives the raw `move()`.
+- Not covered by these fixes, and fenced off instead: the castor-hal
+  `Transport` path, which drove the raw `move()` (see "castor-hal is optional"
+  below).
 - Found by a third review, and fixed: a Goal_Position read that fails is
   retried once and then fails the move (it used to fall back to the stale
   copy); the stop then holds a joint within the window of its chosen goal and
@@ -106,6 +108,26 @@ nothing bounded speed.
 - `kinematics.Chain` (fast forward kinematics for the elbow, wrist and tip),
   `kinematics.Box` / `workspace_box`, `kinematics.declared_speed_limits`.
 - `protocol.SCSProtocol.read_goal_position`.
+
+### castor-hal is optional
+
+- **castor-hal is an extra (`hal`), no longer a dependency.** It is not on
+  PyPI, so a release that required it could not have been installed from PyPI.
+  The robot-md-gateway entry point imports nothing from it. To use the
+  Transport adapter, install castor-hal from its repository, then
+  `so-arm101-actuator[hal]`.
+- **The stop's latch no longer lives in the castor-hal adapter.** `arm.estop`
+  used `transport.SOArm101Transport` as its latch, so with castor-hal absent the
+  stop raised ModuleNotFoundError before it latched, and so did every motion,
+  which consults the latch first. The latch is now `actuator._StopLatch`: the
+  same latch and the same hold, with nothing from castor-hal in it.
+- **The castor-hal adapter moves nothing.** `SOArm101Transport.set_goal` drove
+  the raw `move()` and `home()`: unchecked, unpaced and outside the bus lock,
+  past every fix above. It now declares no goal kinds and refuses every goal as
+  `unsupported_goal` before the bus is touched (out-of-range and unknown-joint
+  goals, which were `out_of_range` and `unknown_target`, get the same refusal).
+  It still reads the arm, and stops it through the actuator's own latch, so the
+  two paths always agree on whether the arm is stopped.
 
 ## [0.3.0]
 

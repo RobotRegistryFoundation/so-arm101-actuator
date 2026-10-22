@@ -14,13 +14,16 @@ authors = [
 ]
 dependencies = [
     "robot-md-gateway>=0.5.0a1",
-    "castor-hal>=0.1",
     "pyserial>=3.5",
     "rich>=13",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "pytest-cov>=4.0"]
+# The castor-hal Transport adapter (so_arm101_actuator.transport), which reads and
+# stops the arm and moves nothing. The robot-md-gateway entry point does not need
+# it. castor-hal is not on PyPI yet: install it from its repository first.
+hal = ["castor-hal>=0.1"]
 
 [project.entry-points."robot_md_gateway.actuators"]
 so-arm101 = "so_arm101_actuator.actuator:SOArm101Actuator"

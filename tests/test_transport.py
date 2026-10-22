@@ -1,8 +1,9 @@
 """SOArm101Transport — the castor-hal adapter (mocked protocol; no hardware).
 
-Reuses the perfect-servo MagicMock pattern from test_actuator.py. Proves the
-SO-ARM101 satisfies the universal Transport seam + drives end-to-end through the
-gateway bridge (TransportActuator)."""
+castor-hal is an optional extra, so this module is skipped without it. The
+adapter reads and stops the arm and moves nothing: its set_goal used to drive
+the raw move(), unchecked and unpaced (EV-03), so every goal is now refused
+before the bus is touched. Its stop is the wrapped actuator's own latch."""
 
 from __future__ import annotations
 
@@ -11,11 +12,15 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from castor_hal.actuator import TransportActuator
-from castor_hal.errors import TransportError, TransportErrorCode
-from castor_hal.goal import BodyTwist, GoalKind, Home, JointPositions
+pytest.importorskip("castor_hal", reason="castor-hal is the optional `hal` extra")
 
-from so_arm101_actuator.transport import SOArm101Transport, make_hal_actuator
+from castor_hal.actuator import TransportActuator  # noqa: E402
+from castor_hal.errors import TransportError, TransportErrorCode  # noqa: E402
+from castor_hal.goal import BodyTwist, Home, JointPositions  # noqa: E402
+
+from so_arm101_actuator.transport import SOArm101Transport, make_hal_actuator  # noqa: E402
+
+JOINTS = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
 
 
 def _make_transport():
@@ -35,90 +40,107 @@ def _make_transport():
     return SOArm101Transport(protocol=proto), proto
 
 
-def test_capabilities():
+def test_capabilities_are_empty():
     t, _ = _make_transport()
-    assert GoalKind.JOINT_POSITIONS in t.capabilities
-    assert GoalKind.HOME in t.capabilities
-    assert not t.supports(BodyTwist())
+    assert t.capabilities == frozenset()
+    for goal in (JointPositions({"shoulder_pan": 0.0}), Home(), BodyTwist()):
+        assert not t.supports(goal)
 
 
-def test_set_goal_joint_positions_reaches():
+@pytest.mark.parametrize("goal", [
+    JointPositions({"shoulder_pan": 0.0}),
+    Home(),
+    JointPositions({"shoulder_pan": 99.0}),
+    JointPositions({"nonexistent": 0.0}),
+    BodyTwist(linear=(1.0, 0.0, 0.0)),
+], ids=["joint_positions", "home", "out_of_range", "unknown_joint", "body_twist"])
+def test_set_goal_refuses_every_goal_before_touching_the_bus(goal):
+    """Valid or not, every goal gets the same refusal, and the protocol is never
+    called: not a write, not a read."""
     t, proto = _make_transport()
-    res = t.set_goal(JointPositions({"shoulder_pan": 0.0}))
-    assert res.reached is True
-    proto.set_position.assert_called_with(motor_id=1, ticks=2048)
-    assert res.state.positions["shoulder_pan"] == pytest.approx(0.0, abs=1e-6)
-    assert "elapsed_s" in res.detail
-
-
-def test_set_goal_home_moves_to_home_pose():
-    t, _ = _make_transport()
-    res = t.set_goal(Home())
-    assert res.reached is True
-    # home pose includes the calibrated shoulder_lift offset (0.10 rad)
-    assert res.state.positions["shoulder_lift"] == pytest.approx(0.10, abs=0.03)
-
-
-def test_out_of_range_is_structured_error():
-    t, _ = _make_transport()
     with pytest.raises(TransportError) as ei:
-        t.set_goal(JointPositions({"shoulder_pan": 99.0}))
-    assert ei.value.code is TransportErrorCode.OUT_OF_RANGE
-
-
-def test_unknown_joint_is_structured_error():
-    t, _ = _make_transport()
-    with pytest.raises(TransportError) as ei:
-        t.set_goal(JointPositions({"nonexistent": 0.0}))
-    assert ei.value.code is TransportErrorCode.UNKNOWN_TARGET
-
-
-def test_unsupported_goal_is_structured_error():
-    t, _ = _make_transport()
-    with pytest.raises(TransportError) as ei:
-        t.set_goal(BodyTwist(linear=(1.0, 0.0, 0.0)))
+        t.set_goal(goal)
     assert ei.value.code is TransportErrorCode.UNSUPPORTED_GOAL
+    assert ei.value.detail["capabilities"] == []
+    assert ei.value.detail["goal_kind"] == goal.kind.value
+    assert proto.method_calls == []
 
 
 def test_read_state_returns_positions_and_temps():
     t, _ = _make_transport()
     st = t.read_state()
-    assert set(st.positions) == set(
-        ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-    )
+    assert set(st.positions) == set(JOINTS)
     assert st.temperatures_c["shoulder_pan"] == 30
     assert st.connected is True
+    assert st.estopped is False
 
 
 def test_estop_holds_and_latches():
     t, proto = _make_transport()
     t.estop()
     assert t._estopped is True
-    # held every joint: read then re-command its current ticks (6 joints)
-    assert proto.set_position.call_count == len(
-        ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
-    )
-    # latched: motion is refused until cleared
-    with pytest.raises(TransportError) as ei:
-        t.set_goal(JointPositions({"shoulder_pan": 0.0}))
-    assert ei.value.code is TransportErrorCode.ESTOPPED
+    assert t.read_state().estopped is True
+    # held every joint: re-command what it holds (6 joints)
+    assert proto.set_position.call_count == len(JOINTS)
     t.clear_estop()
-    assert t.set_goal(JointPositions({"shoulder_pan": 0.0})).reached is True
+    assert t._estopped is False
+    assert t.read_state().estopped is False
+
+
+def test_the_stop_is_the_wrapped_actuators_own_latch():
+    """One latch, never two copies that can disagree: a stop through the adapter
+    refuses the gateway path's motion, and a stop through the gateway path shows
+    here."""
+    t, _ = _make_transport()
+    actuator = t._actuator
+
+    t.estop()
+    refused = actuator.execute(envelope={"tool_name": "arm.home", "tool_args": {}},
+                               manifest_path="", tier="actuate", config={})
+    assert refused.outcome_kind == "denied"
+    assert refused.telemetry["deny"] == "estop_latched"
+
+    t.clear_estop()
+    assert not actuator._latched()
+    stopped = actuator.execute(envelope={"tool_name": "arm.estop", "tool_args": {}},
+                               manifest_path="", tier="read", config={})
+    assert stopped.success is True
+    assert t._estopped is True
 
 
 # -- end-to-end through the gateway bridge ---------------------------------
-def test_through_transport_actuator_move():
-    t, _ = _make_transport()
+@pytest.mark.parametrize("tool_name,tool_args", [
+    ("move", {"joint_positions": {"shoulder_pan": 0.0}}),
+    ("home", {}),
+])
+def test_through_transport_actuator_motion_is_refused(tool_name, tool_args):
+    t, proto = _make_transport()
     a = TransportActuator(t)
     out = a.execute(
-        envelope={"tool_name": "move", "tool_args": {"joint_positions": {"shoulder_pan": 0.0}}},
+        envelope={"tool_name": tool_name, "tool_args": tool_args},
         manifest_path=Path("ROBOT.md"),
         tier="actuate",
         config={},
     )
+    assert out.success is False
+    assert out.outcome_kind == "error"
+    assert out.telemetry["error_code"] == "unsupported_goal"
+    proto.set_position.assert_not_called()
+
+
+def test_through_transport_actuator_estop_holds_and_latches():
+    t, proto = _make_transport()
+    a = TransportActuator(t)
+    out = a.execute(
+        envelope={"tool_name": "estop", "tool_args": {}},
+        manifest_path=Path("ROBOT.md"),
+        tier="read",
+        config={},
+    )
     assert out.success is True
-    assert out.outcome_kind == "executed"
-    assert out.telemetry["goal_kind"] == "joint_positions"
+    assert out.telemetry["estopped"] is True
+    assert t._estopped is True
+    assert proto.set_position.call_count == len(JOINTS)
 
 
 def test_through_transport_actuator_read_state():

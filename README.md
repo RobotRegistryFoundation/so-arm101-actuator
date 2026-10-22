@@ -14,6 +14,13 @@ actuator.move({"shoulder_pan": 0.3})
 print(actuator.read_state())
 ```
 
+The castor-hal Transport adapter (`so_arm101_actuator.transport`) is optional:
+`pip install "so-arm101-actuator[hal]"`, after installing
+[castor-hal](https://github.com/RobotRegistryFoundation/castor-hal), which is
+not on PyPI yet. It reads and stops the arm and moves nothing (see
+[the castor-hal adapter](#the-castor-hal-adapter-moves-nothing)).
+robot-md-gateway's `so-arm101` entry point does not need it.
+
 ## Capabilities
 
 - `move(joint_positions, *, timeout_s=5.0)` — drive named joints to target radians; blocks until in tolerance or timeout.
@@ -368,8 +375,9 @@ What the 100-tick window costs, both ways:
 
 `SO_ARM101_ADOPT_REFERENCE_TICKS` (0 to 1000) moves the window for such an
 arm, at the price of the first cost growing with it, and of a stop finishing up
-to that much of a move it did not pace (the castor-hal path's). The register
-cannot tell sag from a stall; a load or speed reading could.
+to that much of a move it did not pace (a direct call to the raw `move()`;
+every gateway motion is paced). The register cannot tell sag from a stall; a
+load or speed reading could.
 
 **`arm.reach_point` respects the workspace.** Targets less than the margin
 inside the box are refused (`out_of_workspace`), and every step it takes is a
@@ -396,10 +404,17 @@ be built. Declare every axis, as wide as you like. The check runs before every
 planned line, and a manifest re-signed in place is re-read, joint zeros and
 taught pose included (they used to stay as first read while the box moved on).
 
-**Not covered:** the castor-hal `Transport` path (`transport.py`,
-`make_hal_actuator`) still drives the raw `move()`: unpaced, unchecked and
-outside the bus lock. It is not the entry point the gateway uses; switching to
-it would bypass everything above.
+### The castor-hal adapter moves nothing
+
+The castor-hal `Transport` adapter (`transport.py`, `make_hal_actuator`) used to
+drive the raw `move()`: unpaced, unchecked and outside the bus lock, bypassing
+everything above. It now declares no goal kinds and refuses every `set_goal` as
+`unsupported_goal` before the bus is touched. It still reads the arm, and stops
+it through the actuator's own latch, so a stop through either path refuses the
+gateway path's motion. It is not the entry point the gateway uses, and it needs
+the optional `hal` extra. Moving the arm through it again would mean sending its
+goals through the checked, paced path, which needs the manifest that path checks
+against; the `Transport` seam does not carry one.
 
 ## What this is
 
