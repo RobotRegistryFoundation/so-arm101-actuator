@@ -66,7 +66,7 @@ Request to `POST /v1/invoke`:
 
 with `Authorization: Bearer <actuate-tier token>`. `speed` is optional and in
 (0, 1]: the fraction of the declared speed limits the move may use (see
-[Motion is checked and paced](#motion-is-checked-and-paced-v040)).
+[Motion is checked and paced](#motion-is-checked-and-paced-v030)).
 `x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
 (`physics.solver.base_frame`: z up, x forward) and name the **tool tip**, not
 the wrist flange. The envelope's `scope` must be an actuation scope
@@ -250,7 +250,7 @@ Listing them in the signed `ROBOT.md`'s `capabilities:` as well is a separate,
 deliberate operator act — re-signing a robot's root-of-trust document is not a
 side effect of a driver update.
 
-## Motion is checked and paced (v0.4.0)
+## Motion is checked and paced (v0.3.0)
 
 Every motion robot-md-gateway can ask this driver for (`arm.move_to`,
 `arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move`) is one

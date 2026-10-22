@@ -8,6 +8,34 @@ exist while they shipped.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-22
+
+The first release since 0.2.2 (May 2026). It carries Cartesian control
+(September), what EV-03 found and the fixes (October), and castor-hal made
+optional. 0.2.3 was never published; its changes reach PyPI here too.
+
+### castor-hal is optional
+
+- **castor-hal is an extra (`hal`), no longer a dependency.** It is not on
+  PyPI, so a release that required it could not have been installed from PyPI.
+  The robot-md-gateway entry point imports nothing from it. To use the
+  Transport adapter, install castor-hal from its repository, then
+  `so-arm101-actuator[hal]`.
+- **The stop's latch no longer lives in the castor-hal adapter.** `arm.estop`
+  used `transport.SOArm101Transport` as its latch, so with castor-hal absent the
+  stop raised ModuleNotFoundError before it latched, and so did every motion,
+  which consults the latch first. The latch is now `actuator._StopLatch`: the
+  same latch and the same hold, with nothing from castor-hal in it.
+- **The castor-hal adapter moves nothing.** `SOArm101Transport.set_goal` drove
+  the raw `move()` and `home()`: unchecked, unpaced and outside the bus lock,
+  past every fix below. It now declares no goal kinds and refuses every goal as
+  `unsupported_goal` before the bus is touched (out-of-range and unknown-joint
+  goals, which were `out_of_range` and `unknown_target`, get the same refusal).
+  It still reads the arm, and stops it through the actuator's own latch, so the
+  two paths always agree on whether the arm is stopped.
+
+### What EV-03 found, and the fixes
+
 What EV-03 found when it ran this driver behind robot-md-gateway against a
 simulated servo bus with bob's calibration and gravity sag (October 2026), and
 the fixes. Configured to do real work, the tip went up to 13 mm below the
@@ -16,7 +44,7 @@ below them, and full-slew jumps overshot on the way. The driver's own receipts
 put the tip outside the workspace after 270 to 450 moves per ten-minute run, and
 nothing bounded speed.
 
-### Changed (behaviour)
+#### Changed (behaviour)
 
 - **Every gateway motion is a checked, paced line** (`motion.py`). `arm.move_to`,
   `arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move` go from the
@@ -83,7 +111,7 @@ nothing bounded speed.
   under its own lock.
 - Not covered by these fixes, and fenced off instead: the castor-hal
   `Transport` path, which drove the raw `move()` (see "castor-hal is optional"
-  below).
+  above).
 - Found by a third review, and fixed: a Goal_Position read that fails is
   retried once and then fails the move (it used to fall back to the stale
   copy); the stop then holds a joint within the window of its chosen goal and
@@ -103,35 +131,15 @@ nothing bounded speed.
   bob's ready pose (it sits in the margin band of x = 340, and each line out of
   it swung toward that face).
 
-### Added
+#### Added
 
 - `kinematics.Chain` (fast forward kinematics for the elbow, wrist and tip),
   `kinematics.Box` / `workspace_box`, `kinematics.declared_speed_limits`.
 - `protocol.SCSProtocol.read_goal_position`.
 
-### castor-hal is optional
+### Cartesian control
 
-- **castor-hal is an extra (`hal`), no longer a dependency.** It is not on
-  PyPI, so a release that required it could not have been installed from PyPI.
-  The robot-md-gateway entry point imports nothing from it. To use the
-  Transport adapter, install castor-hal from its repository, then
-  `so-arm101-actuator[hal]`.
-- **The stop's latch no longer lives in the castor-hal adapter.** `arm.estop`
-  used `transport.SOArm101Transport` as its latch, so with castor-hal absent the
-  stop raised ModuleNotFoundError before it latched, and so did every motion,
-  which consults the latch first. The latch is now `actuator._StopLatch`: the
-  same latch and the same hold, with nothing from castor-hal in it.
-- **The castor-hal adapter moves nothing.** `SOArm101Transport.set_goal` drove
-  the raw `move()` and `home()`: unchecked, unpaced and outside the bus lock,
-  past every fix above. It now declares no goal kinds and refuses every goal as
-  `unsupported_goal` before the bus is touched (out-of-range and unknown-joint
-  goals, which were `out_of_range` and `unknown_target`, get the same refusal).
-  It still reads the arm, and stops it through the actuator's own latch, so the
-  two paths always agree on whether the arm is stopped.
-
-## [0.3.0]
-
-### Added
+#### Added
 
 - **`arm.move_to`** — Cartesian control. Puts the tool tip on a point in the
   arm's base frame with the tool pointing straight down, solved with the
@@ -164,14 +172,16 @@ nothing bounded speed.
 - `tests/fixtures/so_arm101.robot.md` — a real SO-ARM101's geometry, checked in
   so the suite stops depending on one operator's home directory.
 
-### Changed
+#### Changed
 
 - **`speed` on a position-only bus.** `protocol.py` writes Goal_Position and
   nothing else — there is no velocity register, and adding one is a hardware
   decision, not a software one. `speed` is therefore spelled as joint-space
   interpolation: `ceil(1/speed)` waypoints along the straight line to the
   target, capped at 10. `speed: 1.0` (the default) is one direct command,
-  exactly what `arm.home` and `arm.reach` have always done.
+  exactly what `arm.home` and `arm.reach` have always done. Superseded before
+  release by EV-03's pacing: `speed` is the fraction of the declared speed
+  limits (see "What EV-03 found, and the fixes" above).
 - Manifest frontmatter is now parsed once and cached by mtime. The closed-loop
   reach evaluates forward kinematics nine times per step, each of which re-read
   and re-parsed the whole YAML document; a workspace sweep was spending minutes
@@ -187,7 +197,7 @@ nothing bounded speed.
   the first test to read a manifest was silently re-zeroing every joint for
   every test after it, and results depended on collection order.
 
-### Known limitation (not a defect)
+#### Known limitation (not a defect)
 
 The in-house solver pins the tool axis to vertical. On the SO-ARM101 this driver
 was written against, that is geometrically incompatible with the arm's measured
@@ -202,7 +212,7 @@ re-measured their own arm can widen `SO_ARM101_SAFE_RANGE_RAD` and `arm.move_to`
 starts working; the driver will not widen it on their behalf, because the cost
 of being wrong is a latched servo.
 
-## [0.2.3]
+## [0.2.3] - never published, shipped in 0.3.0
 
 - Closed-loop reaching (`arm.reach_point` / `reach_point`): get to a coordinate
   by measuring and stepping, because the analytic IK cannot solve inside this
