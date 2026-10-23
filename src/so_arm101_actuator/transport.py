@@ -1,14 +1,29 @@
-"""castor-hal Transport adapter for the SO-ARM101 — the first reference adapter.
+"""castor-hal Transport adapter for the SO-ARM101: read and stop only.
 
 This wraps the existing, tested ``SOArm101Actuator`` (serial bus servos via
-``SCSProtocol``) behind the universal ``castor_hal.Transport`` seam. It is the
-proof that the HAL pattern works against a REAL driver: the trust pipeline above
-it (gateway tier/confidence/HiTL gating, signing, RCAN → Atlas) is identical to
-what a tractor (CAN/J1939, ISOBUS) will use — only THIS file changes per machine.
+``SCSProtocol``) behind the universal ``castor_hal.Transport`` seam, so the arm
+can be read and stopped through ``castor_hal.TransportActuator`` (see
+``make_hal_actuator``). It is not the entry point robot-md-gateway uses: that is
+``SOArm101Actuator`` itself, which needs nothing from castor-hal. This module
+does: install castor-hal from its repository first
+(``pip install "castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal"``).
+castor-hal is not on PyPI, so this package names no castor-hal extra.
 
-It is purely ADDITIVE: the original ``SOArm101Actuator`` and its entry point are
-unchanged. To run the arm through the HAL, wrap this in
-``castor_hal.TransportActuator`` (see ``make_hal_actuator``).
+It moves nothing. ``set_goal`` used to drive the actuator's raw ``move()`` and
+``home()``: one Goal_Position jump per joint, not checked against the declared
+workspace, not paced, and outside the bus lock, so everything EV-03 fixed on the
+gateway path (October 2026) was bypassed here. It now accepts no goals:
+``capabilities`` is empty and every ``set_goal`` is refused as
+``unsupported_goal`` before the bus is touched. Sending it through the checked,
+paced path instead would need the manifest that path checks against, which the
+``Transport`` seam does not carry.
+
+The stop uses the wrapped actuator's own latch (``_estop_transport``). The latch
+belongs to one ``SOArm101Actuator`` instance, so this adapter and the gateway
+path share it only when the adapter wraps the gateway's own instance
+(``SOArm101Transport(actuator=...)``). ``make_hal_actuator`` and ``from_config``
+build an instance of their own: a stop through them does not block the gateway's
+motion, and on real hardware it cannot open the port while the gateway holds it.
 
 SAFETY: ``estop()`` is a best-effort SOFTWARE hold (each joint is sent a goal
 to hold: the goal it was holding, or where it reads if it was moving; a repeated
@@ -19,24 +34,33 @@ torque-off here, and software cannot guarantee the arm physically stopped. See
 
 from __future__ import annotations
 
-import time
+try:
+    from castor_hal.errors import TransportError, TransportErrorCode
+    from castor_hal.state import TransportState
+    from castor_hal.transport import GoalResult, Transport
+except ModuleNotFoundError as exc:  # castor-hal is optional and not on PyPI
+    if exc.name != "castor_hal":
+        raise
+    raise ModuleNotFoundError(
+        "so_arm101_actuator.transport is the castor-hal adapter, and castor-hal is "
+        "not installed. It is not on PyPI; install it from its repository: "
+        "pip install 'castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal'. "
+        "The robot-md-gateway entry point, SOArm101Actuator, does not need it.",
+        name="castor_hal",
+    ) from exc
 
-from castor_hal.errors import TransportError, TransportErrorCode
-from castor_hal.goal import GoalKind
-from castor_hal.state import TransportState
-from castor_hal.transport import GoalResult, Transport
-
-from so_arm101_actuator import config
-from so_arm101_actuator.actuator import SOArm101Actuator
-from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
+from so_arm101_actuator.actuator import STOP_BUS_WAIT_S, SOArm101Actuator, _bus, _StopLatch
+from so_arm101_actuator.errors import DeniedError
 
 
 class SOArm101Transport(Transport):
-    """SO-ARM101 (6-DOF + gripper) as a castor-hal Transport. RPN-000000000002."""
+    """SO-ARM101 (6-DOF + gripper) as a castor-hal Transport, read and stop only.
+    RPN-000000000002."""
 
-    capabilities = frozenset({GoalKind.JOINT_POSITIONS, GoalKind.HOME})
+    #: No goal kinds: motion through this adapter is fenced off (module note).
+    capabilities = frozenset()
     name = "so-arm101"
-    description = "SO-ARM101 serial-bus-servo transport (RPN-000000000002)"
+    description = "SO-ARM101 serial-bus-servo transport, read and stop only (RPN-000000000002)"
 
     def __init__(
         self,
@@ -57,9 +81,10 @@ class SOArm101Transport(Transport):
         )
         self._port = port
         self._baud = baud
+        # Accepted so existing callers and from_config keep working; nothing
+        # moves through this adapter, so nothing reads them.
         self._move_timeout_s = move_timeout_s
         self._home_timeout_s = home_timeout_s
-        self._estopped = False
 
     @classmethod
     def from_config(cls, config_dict: dict | None) -> "SOArm101Transport":
@@ -72,6 +97,15 @@ class SOArm101Transport(Transport):
             move_timeout_s=float(cfg.get("move_timeout_s", 5.0)),
             home_timeout_s=float(cfg.get("home_timeout_s", 10.0)),
         )
+
+    def _latch(self) -> _StopLatch:
+        """The wrapped actuator's own stop latch, built on first use."""
+        return self._actuator._estop_transport(port=self._port, baud=self._baud)
+
+    @property
+    def _estopped(self) -> bool:
+        """Whether the wrapped actuator's stop is latched. Read, never copied."""
+        return bool(self._latch()._estopped)
 
     # -- lifecycle ---------------------------------------------------------
     def open(self) -> None:
@@ -95,38 +129,22 @@ class SOArm101Transport(Transport):
 
     # -- actuation / sensing ----------------------------------------------
     def set_goal(self, goal) -> GoalResult:
-        self.ensure_supported(goal)
-        if self._estopped:
-            raise TransportError(
-                TransportErrorCode.ESTOPPED,
-                "transport is e-stopped; clear it before commanding motion",
-            )
-        try:
-            if goal.kind is GoalKind.HOME:
-                result = self._actuator.home(timeout_s=self._home_timeout_s)
-            else:  # JOINT_POSITIONS (the only other accepted kind)
-                result = self._actuator.move(goal.positions, timeout_s=self._move_timeout_s)
-        except UnknownJointError as exc:
-            raise TransportError(
-                TransportErrorCode.UNKNOWN_TARGET, f"unknown joint: {exc}",
-                detail={"joints": sorted(config.JOINTS)},
-            ) from exc
-        except OutOfRangeError as exc:
-            raise TransportError(TransportErrorCode.OUT_OF_RANGE, str(exc)) from exc
-        except (IOError, OSError) as exc:
-            raise TransportError(TransportErrorCode.IO_ERROR, str(exc)) from exc
-
-        state = TransportState(
-            connected=True,
-            estopped=self._estopped,
-            positions=dict(result["final_positions"]),
-            unit="rad",
-            timestamp_s=time.monotonic(),
-        )
-        return GoalResult(
-            reached=bool(result["reached"]),
-            state=state,
-            detail={"elapsed_s": result["elapsed_s"], "final_positions": dict(result["final_positions"])},
+        """Refused, for every goal, before the bus is touched: this adapter
+        moves nothing (see the module note). Move the arm through
+        robot-md-gateway's ``so-arm101`` entry point, which checks and paces
+        every motion."""
+        kind = getattr(goal, "kind", None)
+        raise TransportError(
+            TransportErrorCode.UNSUPPORTED_GOAL,
+            "the SO-ARM101 castor-hal adapter accepts no goals: its motion path drove "
+            "the raw move() (not checked against the workspace, not paced, outside the "
+            "bus lock), so it is disabled. Move the arm through robot-md-gateway's "
+            "so-arm101 entry point, which checks and paces every motion.",
+            detail={
+                "transport": self.name,
+                "goal_kind": getattr(kind, "value", str(kind)),
+                "capabilities": [],
+            },
         )
 
     def read_state(self) -> TransportState:
@@ -146,7 +164,9 @@ class SOArm101Transport(Transport):
     def estop(self) -> None:
         """Best-effort SOFTWARE hold (NOT a hardware e-stop — see module note).
         Holds each joint (``SOArm101Actuator._hold_pose``) so motion stops, and
-        latches the e-stop flag (cleared via ``clear_estop``).
+        latches the wrapped actuator's own stop (cleared via ``clear_estop``).
+        The gateway path refuses motion too only when it uses that same actuator
+        instance (see the module note).
 
         What is held is chosen once per latch: the goal a joint was last sent
         when it is holding that goal, otherwise where it reads. A repeated stop
@@ -155,12 +175,17 @@ class SOArm101Transport(Transport):
         the goal by the sag: 9 cm in 8 s of stops 0.2 s apart (EV-03,
         simulation, October 2026).
 
-        FAIL-SAFE: the flag is latched FIRST, before the bus hold is attempted —
+        FAIL-SAFE: the latch is set FIRST, before the bus hold is attempted —
         so if the link is down (``open`` raises) or the hold cannot be sent, the
-        transport stays e-stopped and refuses new motion (``clear_estop`` +
-        retry to recover), rather than silently accepting motion after a stop we
-        couldn't confirm. We fail toward stopped, never toward movable."""
-        self._estopped = True
+        arm stays e-stopped and refuses new motion (``clear_estop`` + retry to
+        recover), rather than silently accepting motion after a stop we
+        couldn't confirm. We fail toward stopped, never toward movable.
+
+        That holds when this method is called. castor-hal's ``TransportActuator``
+        calls ``open()`` before it dispatches, so if the port cannot be opened
+        the stop fails as ``not_connected`` before this method runs, and nothing
+        latches."""
+        self._latch()._estopped = True
         self.open()
         try:
             self._actuator._hold_pose()
@@ -170,19 +195,31 @@ class SOArm101Transport(Transport):
             ) from exc
 
     def clear_estop(self) -> None:
-        """Release the latched software e-stop so motion can be commanded again.
-        The arm keeps holding its pose; the next stop chooses its hold afresh."""
-        self._estopped = False
-        self._actuator._held = None
+        """Release the latched software e-stop (the wrapped actuator's own) so
+        motion can be commanded again. The arm keeps holding its pose; the next
+        stop chooses its hold afresh.
+
+        Under the bus lock, as the gateway's ``arm.estop.clear`` takes it, so a
+        clear cannot interleave with a stop that is still choosing or sending
+        its hold. If the bus stays busy for ``STOP_BUS_WAIT_S``, the latch stays
+        set and this raises ``timeout``."""
+        try:
+            with _bus(STOP_BUS_WAIT_S):
+                self._latch().clear_estop()
+        except DeniedError as exc:
+            raise TransportError(
+                TransportErrorCode.TIMEOUT, f"e-stop not cleared: {exc}"
+            ) from exc
 
 
 def make_hal_actuator(config_dict: dict | None = None):
-    """Convenience: an SO-ARM101 wrapped as a gateway actuator through the HAL.
+    """Convenience: an SO-ARM101 wrapped as a gateway actuator through the HAL,
+    for reading and stopping only (it refuses every goal; see the module note).
 
     Returns a ``castor_hal.TransportActuator`` that builds an ``SOArm101Transport``
-    lazily from the gateway config on first ``execute``. A future entry point can
-    point at this once the HAL path is hardware-validated; the existing
-    ``so-arm101`` entry point (``SOArm101Actuator``) is left untouched.
+    lazily from the gateway config on first ``execute``. No entry point uses it;
+    the ``so-arm101`` entry point (``SOArm101Actuator``) is the one that moves
+    the arm.
     """
     from castor_hal.actuator import TransportActuator
 

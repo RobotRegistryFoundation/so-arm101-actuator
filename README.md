@@ -14,6 +14,16 @@ actuator.move({"shoulder_pan": 0.3})
 print(actuator.read_state())
 ```
 
+The castor-hal Transport adapter (`so_arm101_actuator.transport`) is optional.
+It needs [castor-hal](https://github.com/RobotRegistryFoundation/castor-hal),
+which is not on PyPI, so install it from its repository:
+`pip install "castor-hal @ git+https://github.com/RobotRegistryFoundation/castor-hal"`.
+This package names no castor-hal extra: an extra naming an unclaimed PyPI
+project would install whatever is later published under that name. The adapter
+reads and stops the arm and moves nothing (see
+[the castor-hal adapter](#the-castor-hal-adapter-moves-nothing)).
+robot-md-gateway's `so-arm101` entry point does not need it.
+
 ## Capabilities
 
 - `move(joint_positions, *, timeout_s=5.0)` — drive named joints to target radians; blocks until in tolerance or timeout.
@@ -59,7 +69,7 @@ Request to `POST /v1/invoke`:
 
 with `Authorization: Bearer <actuate-tier token>`. `speed` is optional and in
 (0, 1]: the fraction of the declared speed limits the move may use (see
-[Motion is checked and paced](#motion-is-checked-and-paced-v040)).
+[Motion is checked and paced](#motion-is-checked-and-paced-v030)).
 `x_mm`/`y_mm`/`z_mm` are millimetres in the arm's **base frame**
 (`physics.solver.base_frame`: z up, x forward) and name the **tool tip**, not
 the wrist flange. The envelope's `scope` must be an actuation scope
@@ -243,7 +253,7 @@ Listing them in the signed `ROBOT.md`'s `capabilities:` as well is a separate,
 deliberate operator act — re-signing a robot's root-of-trust document is not a
 side effect of a driver update.
 
-## Motion is checked and paced (v0.4.0)
+## Motion is checked and paced (v0.3.0)
 
 Every motion robot-md-gateway can ask this driver for (`arm.move_to`,
 `arm.home`, `arm.reach`, `arm.reach_point`'s steps and a bare `move`) is one
@@ -368,8 +378,9 @@ What the 100-tick window costs, both ways:
 
 `SO_ARM101_ADOPT_REFERENCE_TICKS` (0 to 1000) moves the window for such an
 arm, at the price of the first cost growing with it, and of a stop finishing up
-to that much of a move it did not pace (the castor-hal path's). The register
-cannot tell sag from a stall; a load or speed reading could.
+to that much of a move it did not pace (a direct call to the raw `move()`;
+every gateway motion is paced). The register cannot tell sag from a stall; a
+load or speed reading could.
 
 **`arm.reach_point` respects the workspace.** Targets less than the margin
 inside the box are refused (`out_of_workspace`), and every step it takes is a
@@ -396,10 +407,24 @@ be built. Declare every axis, as wide as you like. The check runs before every
 planned line, and a manifest re-signed in place is re-read, joint zeros and
 taught pose included (they used to stay as first read while the box moved on).
 
-**Not covered:** the castor-hal `Transport` path (`transport.py`,
-`make_hal_actuator`) still drives the raw `move()`: unpaced, unchecked and
-outside the bus lock. It is not the entry point the gateway uses; switching to
-it would bypass everything above.
+### The castor-hal adapter moves nothing
+
+The castor-hal `Transport` adapter (`transport.py`, `make_hal_actuator`) used to
+drive the raw `move()`: unpaced, unchecked and outside the bus lock, bypassing
+everything above. It now declares no goal kinds and refuses every `set_goal` as
+`unsupported_goal` before any servo traffic (castor-hal's `TransportActuator`
+still opens the port before it dispatches). It still reads the arm, and stops it
+through the wrapped actuator's own latch. That latch belongs to one
+`SOArm101Actuator` instance: a stop through the adapter refuses the gateway
+path's motion only when the adapter wraps the gateway's own instance
+(`SOArm101Transport(actuator=...)`). `make_hal_actuator` builds an instance of
+its own, so its stop does not block the gateway, and on real hardware it cannot
+open the port while the gateway holds it. The adapter's `clear_estop` takes the
+bus lock, as the gateway's `arm.estop.clear` does. It is not the entry point the
+gateway uses, and it needs castor-hal installed from its repository. Moving the
+arm through it again would mean sending its goals through the checked, paced
+path, which needs the manifest that path checks against; the `Transport` seam
+does not carry one.
 
 ## What this is
 
