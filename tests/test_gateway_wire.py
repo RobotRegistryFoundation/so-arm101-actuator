@@ -426,7 +426,10 @@ def _skip_without_the_safety_watchdog() -> None:
 def test_a_driver_tier_refusal_is_a_signed_403_recorded_like_its_other_refusals(
         signed_manifest, tool_name, token, scope):
     """The driver's own tier binding saying no, seen from the wire. No tier is
-    bound to these tools at the gateway, so the request reaches the driver.
+    bound to these tools at the gateway, so the request reaches the driver,
+    except an anonymous declared stop on robot-md-gateway#35 from 3020f7f,
+    which the gateway refuses itself (below). The driver's refusal of that one
+    is pinned by test_actuator.py's arm.estop-anon case.
 
     This used to come back as HTTP 500, with the audit chain recording
     decision "allow", reason "ok" and outcome "error" (review of
@@ -451,12 +454,20 @@ def test_a_driver_tier_refusal_is_a_signed_403_recorded_like_its_other_refusals(
 
     assert response.status_code == 403, response.text
     detail = response.json()["detail"]
+    assert "attestation" in detail
+    entry = chain.entries[-1]
+    if detail["deny"] == "tier_policy":
+        # robot-md-gateway#35 from 3020f7f refuses an anonymous DECLARED STOP
+        # itself, before dispatch, so the driver is never asked. Still a signed
+        # 403 recorded as a deny, with nothing on the bus and nothing latched.
+        assert (tool_name, token) == ("arm.estop", None)
+        assert entry.decision == "deny" and entry.actuator_outcome_kind is None
+        assert proto.method_calls == [] and writes == [] and arm._latched() is False
+        return
     assert detail["deny"] == "actuator_policy"
     assert detail["actuator_name"] == "so-arm101"
     assert detail["telemetry"]["deny"] == "tool_tier"
     assert detail["reason"].startswith("tool_tier: ")
-    assert "attestation" in detail
-    entry = chain.entries[-1]
     assert entry.actuator_outcome_kind == "denied"
     # Recorded exactly as the out_of_workspace refusal was. robot-md-gateway#35
     # records a driver's refusal as a deny; gateways before it (0.5.0a9 on
@@ -522,9 +533,6 @@ def test_a_trip_ends_a_paced_move_and_the_real_driver_holds(signed_manifest, mon
         moved = response.json()["telemetry"]
         assert moved["motion"]["stopped_by_estop"] is True
         assert moved["reached"] is False
-        # Ended by the stop, not by running out of setpoints: at speed 0.1 the
-        # move was planned to take several times the 1 s heartbeat limit.
-        assert moved["elapsed_s"] < moved["motion"]["planned_duration_s"] / 2, moved
         assert monitor.state is GatewayState.SAFE_STOP
 
         # The gateway's own stop, once, executed by this driver. It is recorded
@@ -548,6 +556,16 @@ def test_a_trip_ends_a_paced_move_and_the_real_driver_holds(signed_manifest, mon
         time.sleep(0.3)
         assert len(writes) == hold_writes
 
+        # Ended by the stop, not by running out of setpoints: at speed 0.1 the
+        # move was planned as hundreds of them (53 of 704 go out in a normal
+        # run). Counted in setpoints streamed, not seconds: a process that
+        # stalls streams nothing while it is stalled, so only a stop that comes
+        # late to a live process can fail this.
+        setpoint_writes = writes[:-len(arm_config.JOINTS)]          # all but the hold
+        per = len({motor for motor, _ in setpoint_writes})          # joints per setpoint
+        streamed = len(setpoint_writes) / per
+        assert streamed < moved["motion"]["setpoints"] / 2, (streamed, moved["motion"])
+
         # A new move is refused by the tripped gateway, and recorded as a deny.
         refused = http.post("/v1/invoke", json=move, headers=actuate)
         assert refused.status_code == 403, refused.text
@@ -570,10 +588,11 @@ def test_on_a_tripped_gateway_a_bearer_stop_holds_and_an_anonymous_one_is_a_deny
     A read-bearer arm.estop passes the tripped gateway and re-sends exactly
     the goals the gateway's stop chose: a repeated stop does not ratchet.
 
-    An anonymous arm.estop passes the gateway too (no tier is bound to it
-    there) and the driver refuses it: a signed 403 recorded as a deny. It used
-    to be a 500 recorded as allow/ok, tripped or not (review of
-    robot-md-gateway#35, P2)."""
+    An anonymous arm.estop is a signed 403 recorded as a deny, with nothing on
+    the bus. Up to robot-md-gateway#35 at 74bff6e it passes the gateway (no
+    tier is bound to it there) and the driver refuses it; it used to be a 500
+    recorded as allow/ok, tripped or not (review of robot-md-gateway#35, P2).
+    From 3020f7f the gateway refuses it itself, before dispatch."""
     _skip_without_the_safety_watchdog()
     proto, _, writes, _ = _logging_bus()
     chain = AuditChain()
@@ -598,9 +617,12 @@ def test_on_a_tripped_gateway_a_bearer_stop_holds_and_an_anonymous_one_is_a_deny
         anonymous = http.post("/v1/invoke", json=stop)
         assert anonymous.status_code == 403, anonymous.text
         detail = anonymous.json()["detail"]
-        assert detail["deny"] == "actuator_policy"
-        assert detail["telemetry"]["deny"] == "tool_tier"
         entry = chain.entries[-1]
         assert entry.decision == "deny"
-        assert entry.actuator_outcome_kind == "denied"
+        # The driver's refusal, or (robot-md-gateway#35 from 3020f7f) the
+        # gateway's own, before dispatch.
+        assert detail["deny"] in ("actuator_policy", "tier_policy")
+        if detail["deny"] == "actuator_policy":
+            assert detail["telemetry"]["deny"] == "tool_tier"
+            assert entry.actuator_outcome_kind == "denied"
         assert len(writes) == after
