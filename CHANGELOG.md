@@ -8,11 +8,94 @@ exist while they shipped.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-22
+## [0.3.0] - 2026-10-23
 
 The first release since 0.2.2 (May 2026). It carries Cartesian control
-(September), what EV-03 found and the fixes (October), and castor-hal made
-optional. 0.2.3 was never published; its changes reach PyPI here too.
+(September), the arm's stop through `/v1/invoke` (OC-04, September), what EV-03
+found and the fixes (October), and castor-hal made optional. 0.2.3 was never
+published; its changes reach PyPI here too.
+
+### Upgrading from 0.2.2
+
+`arm.estop` and `arm.estop.clear` are new to robot-md-gateway's `/v1/invoke`
+(see "The stop" below). The gateway refuses every tool its allowlist does not
+name, so on a deployment upgraded from 0.2.2 no caller can stop the arm through
+`/v1/invoke` until the operator adds both, and holds the clear to the
+commission tier, in the gateway's environment file (`gateway.env`). Until then,
+what stops the arm depends on the gateway:
+
+- **robot-md-gateway 0.5.0a9** (PyPI) never sends a stop of its own, so
+  nothing stops the arm through the gateway.
+- **robot-md-gateway#35** sends `arm.estop` itself when its safety monitor
+  trips, whatever its allowlist says, so a trip still latches the arm. A
+  caller's `arm.estop` is still refused (`tool_allowlist`).
+
+The gateway reads `gateway.env` only at start, so restart it afterwards:
+
+```bash
+ROBOT_MD_TOOL_ALLOWLIST="<the tools already listed>,arm.estop,arm.estop.clear"
+ROBOT_MD_TOOL_MIN_TIER="<the pairs already listed>,arm.estop.clear:commission"
+```
+
+Each is one comma-separated list. `ROBOT_MD_TOOL_MIN_TIER` takes `tool:tier|tier`
+pairs, and names the tiers that may invoke a tool (it is not a minimum). The
+driver holds the same line itself (`REQUIRED_TIERS`); with the second entry the
+gateway refuses a lower tier first, with its own signed 403. Keep the
+commission bearer out of every agent's configuration: it is what makes a
+stopped arm movable again.
+
+While the allowlist names any of the arm's motion tools and not `arm.estop`,
+both gateways log `allowlist_has_no_stop` at ERROR when they start. After the
+restart, check that the line is gone.
+
+### The stop
+
+#### Added
+
+- **`arm.estop` and `arm.estop.clear` through `/v1/invoke`** (OC-04): the first
+  stop for this arm that a caller can invoke. 0.2.2 had none, and the latch
+  0.2.3 wrote for the castor-hal adapter was named by no capability list, tier
+  table or dispatch branch. `arm.estop` latches, then holds every joint, and
+  every motion tool is refused while it is latched (`estop_latched`).
+  `arm.estop.clear` releases the latch. Tiers (`REQUIRED_TIERS`): read, actuate
+  and commission for the stop, commission only for the clear, so the read tier
+  can stop this arm and cannot start it.
+  The tool descriptions and the stop's telemetry carry `ESTOP_SAFETY_NOTE`: a
+  best-effort software hold, not a hardware e-stop. How the stop interrupts a
+  move and holds is under "What EV-03 found, and the fixes" below.
+- `MOTION_CAPABILITIES` and `STOP_CAPABILITIES`, declared on the actuator as
+  `motion_capabilities` and `stop_capabilities` for robot-md-gateway's startup
+  checks and its stop path.
+
+#### Fixed
+
+- **A tier refusal is a decision, not a fault.** When the caller's tier may not
+  invoke a tool (`REQUIRED_TIERS`), `execute` now returns `outcome_kind="denied"`
+  with the code `tool_tier`, like every other refusal in `SOArm101Actuator`. The
+  per-tool tier check (0.2.3, never published) returned `"error"`, which
+  robot-md-gateway records as an allowed call that failed (decision `allow`,
+  reason `ok`) and answers with HTTP 500. An anonymous `arm.estop` therefore
+  came back as a 500 on an allow record, and nothing latched (review of
+  robot-md-gateway#35, Q4). It is now a signed 403. robot-md-gateway#35
+  records it as a deny; robot-md-gateway 0.5.0a9 still writes `allow` on the
+  record for every driver refusal. From 3020f7f, robot-md-gateway#35 also
+  refuses an anonymous `arm.estop` itself, before the driver is asked. Nothing
+  else changes: the read tier and above may stop the arm, an anonymous caller
+  may not, and a refused stop latches nothing.
+- **`arm.reach` with an unknown target is a refusal, not a fault.** Any target
+  but `ready` returned `"error"` ("unknown reach target"), an HTTP 500 on an
+  allow record. It is now `bad_args`, a signed 403. Nothing reaches the bus,
+  as before.
+
+Every refusal in `SOArm101Actuator` is now `denied`. What still returns
+`"error"` is not a refusal: a fault on the bus or in the actuator config, a
+hold that could not be sent (the latch stands), an `arm.reach_point` that ran
+and did not arrive, an unexpected exception, and a tool the driver does not
+implement (`unknown capability`), which an allowlist that names only
+implemented tools keeps out. The castor-hal adapter is not covered: it refuses
+every goal as `unsupported_goal` (see "castor-hal is optional"), and castor-hal
+0.2.0 still reports that as `"error"`, an HTTP 500 (castor-hal's own CHANGELOG
+lists it under "Known").
 
 ### castor-hal is optional
 
@@ -72,13 +155,14 @@ nothing bounded speed.
   Moves take longer. The `waypoints` telemetry key is now the number
   of setpoints streamed; a `motion` block reports the pacing, the limits, how
   close the path came to a face and whether a stop ended it.
-- **`arm.estop` interrupts a move and no longer ratchets.** It latches before it
+- **`arm.estop` (new in this release, see "The stop") interrupts a move and does
+  not ratchet.** It latches before it
   waits for the bus lock, a paced move checks the latch before every setpoint,
   every other request gives way while the latching stop waits for the bus, and
   otherwise waits at most 1 s before it is refused as `busy`. The hold re-sends the goals
   it chose for this latch while the servos still hold them, instead of
-  re-reading the sagged encoders on every repeat (which walked the arm down
-  9 cm in 8 s in simulation); a joint whose servo no longer holds them (a reset)
+  re-reading the sagged encoders on every repeat (as first written, that walked
+  the arm down 9 cm in 8 s in simulation); a joint whose servo no longer holds them (a reset)
   is chosen again from what it holds. Each goal is the one the servo's own
   Goal_Position register reports, when the joint reads within 100 ticks of it,
   not its sag. An arm sagging more than 100 ticks drops by its sag on each
