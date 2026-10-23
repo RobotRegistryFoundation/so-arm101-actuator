@@ -372,7 +372,7 @@ def _gateway(signed_manifest, proto, *, chain: AuditChain,
     app = make_app(
         resolver=_Resolver(),
         tool_allowlist=ToolAllowlist(allowed_tools=(
-            "arm.move_to", "arm.state", "arm.estop", "arm.estop.clear")),
+            "arm.move_to", "arm.reach", "arm.state", "arm.estop", "arm.estop.clear")),
         tool_tier_requirements={},
         bearer_tiers={BEARER: "actuate", READ_BEARER: "read",
                       COMMISSION_BEARER: "commission"},
@@ -479,6 +479,35 @@ def test_a_driver_tier_refusal_is_a_signed_403_recorded_like_its_other_refusals(
     # Refused before the bus: nothing read, nothing written, nothing latched.
     assert proto.method_calls == []
     assert writes == []
+    assert arm._latched() is False
+
+
+def test_an_unknown_reach_target_is_a_signed_403_recorded_like_its_other_refusals(
+        signed_manifest):
+    """arm.reach with a target it does not know, from an actuate bearer. It
+    used to come back as HTTP 500, recorded as an allowed call that failed
+    (review of so-arm101-actuator#9, finding 2)."""
+    proto, _, writes, _ = _logging_bus()
+    chain = AuditChain()
+    app, arm, manifest = _gateway(signed_manifest, proto, chain=chain)
+    actuate = {"Authorization": f"Bearer {BEARER}"}
+    with TestClient(app) as http:
+        reference = http.post("/v1/invoke", headers=actuate,
+                              json=_envelope("arm.move_to", {**TARGET, "x_mm": 500.0}, manifest))
+        assert reference.status_code == 403, reference.text
+        workspace = chain.entries[-1]
+        response = http.post("/v1/invoke", headers=actuate,
+                             json=_envelope("arm.reach", {"target": "nowhere"}, manifest))
+
+    assert response.status_code == 403, response.text
+    detail = response.json()["detail"]
+    assert detail["deny"] == "actuator_policy"
+    assert detail["telemetry"]["deny"] == "bad_args"
+    assert "attestation" in detail
+    entry = chain.entries[-1]
+    assert entry.actuator_outcome_kind == "denied"
+    assert entry.decision == workspace.decision          # a deny from robot-md-gateway#35 on
+    assert proto.method_calls == [] and writes == []
     assert arm._latched() is False
 
 

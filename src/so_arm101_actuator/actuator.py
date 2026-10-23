@@ -1678,11 +1678,10 @@ class SOArm101Actuator:
         elif tool_name == "arm.reach":
             target = tool_args.get("target", "ready")
             if target != "ready":
-                return ActuatorOutcome(
-                    success=False,
-                    outcome_kind="error",
-                    error_message=f"unknown reach target: {target!r}",
-                )
+                # A bad argument, refused before the bus like the others: a
+                # signed 403, not a 500 recorded as an allowed call that failed.
+                return _denied(DeniedError(
+                    "bad_args", f"arm.reach knows one target, 'ready'; not {target!r}"))
             reach_pose = self._home_pose_for_motion()
             reach_pose["shoulder_pan"] = reach_pose.get("shoulder_pan", 0.0) + 0.35
             # Derived from the taught pose, not taught itself: it gets no

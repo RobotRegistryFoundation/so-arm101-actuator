@@ -159,7 +159,7 @@ same thing as a sentence, and may be reworded:
 | `deny` | Meaning |
 |---|---|
 | `tool_tier` | the caller's tier may not invoke this tool (the Tiers column above); checked first, for every tool, and nothing reaches the bus |
-| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1] |
+| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1]; for `arm.reach`, a `target` other than `ready` |
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
 | `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
 | `too_slow` | `speed` so small the move would take longer than 60 s |

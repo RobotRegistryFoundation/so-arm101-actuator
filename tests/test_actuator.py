@@ -528,6 +528,24 @@ def test_the_refusals_cover_the_stop_and_the_clear():
     assert ("arm.estop.clear", "actuate") in _TIER_REFUSALS
 
 
+@pytest.mark.parametrize("target", ["nowhere", "READY", "", None, 3, ["ready"]])
+def test_an_unknown_reach_target_is_a_refusal_not_a_fault(target):
+    """arm.reach knows one target, "ready". Any other is a bad argument,
+    refused before the bus like the rest. It was an `error` (HTTP 500 on an
+    allow record), the same class of fault as the tier refusal (review of
+    so-arm101-actuator#9, finding 2)."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(
+        envelope={"msg_id": "m-reach", "tool_name": "arm.reach", "tool_args": {"target": target}},
+        manifest_path="", tier="actuate", config={})
+
+    assert outcome.success is False
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "bad_args"
+    assert repr(target) in outcome.telemetry["reason"]
+    assert proto.method_calls == []
+
+
 @pytest.mark.parametrize("tier", ["read", "actuate", "commission"])
 def test_arm_estop_is_accepted_at_every_bearer_tier(tier):
     """The other side of the refusal: every tier a bearer can hold may stop the
