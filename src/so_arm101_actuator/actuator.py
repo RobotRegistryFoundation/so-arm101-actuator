@@ -1470,16 +1470,20 @@ class SOArm101Actuator:
         # allowlist) — so an envelope claiming scope="OBSERVE" while naming a
         # motion tool passes both. Binding tier to the TOOL is the check that
         # cannot be talked out of by envelope contents.
+        #
+        # A tier refusal is a decision like every other refusal here, so it is
+        # `denied`, which robot-md-gateway answers with a signed 403 (and, from
+        # robot-md-gateway#35 on, records as a deny). It used to be `error`,
+        # which the gateway records as an allowed call that failed (decision
+        # "allow", reason "ok") and answers with a 500: an anonymous arm.estop
+        # read as a stop let through that then broke. Nothing is latched and
+        # nothing reaches the bus on this path.
         required = REQUIRED_TIERS.get(tool_name)
         if required is not None and tier not in required:
-            return ActuatorOutcome(
-                success=False,
-                outcome_kind="error",
-                error_message=(
-                    f"tier {tier!r} may not invoke {tool_name!r} "
-                    f"(requires one of {sorted(required)})"
-                ),
-            )
+            return _denied(DeniedError(
+                "tool_tier",
+                f"tier {tier!r} may not invoke {tool_name!r} "
+                f"(requires one of {sorted(required)})"))
 
         try:
             port = str((config or {}).get("port", "/dev/ttyACM0"))

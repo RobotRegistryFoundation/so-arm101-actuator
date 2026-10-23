@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from so_arm101_actuator.actuator import SOArm101Actuator
+from so_arm101_actuator.actuator import REQUIRED_TIERS, SOArm101Actuator
 from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
 
 
@@ -481,6 +481,66 @@ def test_estop_clear_is_refused_below_commission_and_works_at_commission(fake_cl
         envelope={"msg_id": "m-4", "tool_name": "arm.home", "tool_args": {}},
         manifest_path="", tier="actuate", config={})
     assert moved.outcome_kind == "executed"
+
+
+# --- a tier refusal is a decision -------------------------------------------
+#
+# robot-md-gateway turns `denied` into a signed 403 (recorded as a deny from
+# robot-md-gateway#35 on), and any other unsuccessful outcome into a 500
+# recorded as an allowed call that failed (decision "allow", reason "ok"). The
+# tier refusal used to be `error`, so an anonymous arm.estop came back through
+# the gateway as a 500 on an allow record (review of robot-md-gateway#35, Q4).
+
+#: Every (tool, tier) pair REQUIRED_TIERS refuses, over the three bearer tiers,
+#: the gateway's anonymous fallback, and a tier this driver has never heard of.
+_TIER_REFUSALS = [
+    (tool, tier)
+    for tool, allowed in sorted(REQUIRED_TIERS.items())
+    for tier in ("anon", "read", "actuate", "commission", "not-a-tier")
+    if tier not in allowed
+]
+
+
+@pytest.mark.parametrize("tool_name,tier", _TIER_REFUSALS)
+def test_a_tier_refusal_is_denied_not_an_error(tool_name, tier):
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(
+        envelope={"msg_id": "m-tier", "tool_name": tool_name, "tool_args": {}},
+        manifest_path="", tier=tier, config={})
+
+    assert outcome.success is False
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "tool_tier"
+    assert repr(tier) in outcome.telemetry["reason"]
+    assert repr(tool_name) in outcome.telemetry["reason"]
+    assert outcome.error_message.startswith("tool_tier: ")
+    # Refused before anything else: no servo traffic at all, and no latch. A
+    # refused stop is not a stop.
+    assert proto.method_calls == []
+    assert actuator._latched() is False
+
+
+def test_the_refusals_cover_the_stop_and_the_clear():
+    """The two pairs the review reproduced are among the parametrized cases, so
+    the test above cannot pass by having nothing to check."""
+    assert ("arm.estop", "anon") in _TIER_REFUSALS
+    assert ("arm.estop.clear", "read") in _TIER_REFUSALS
+    assert ("arm.estop.clear", "actuate") in _TIER_REFUSALS
+
+
+@pytest.mark.parametrize("tier", ["read", "actuate", "commission"])
+def test_arm_estop_is_accepted_at_every_bearer_tier(tier):
+    """The other side of the refusal: every tier a bearer can hold may stop the
+    arm. The read tier on purpose (REQUIRED_TIERS): the runtime process holds
+    only the read bearer, and robot-md-gateway#35 sends the gateway's own stop
+    at the read tier."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",
+                               tier=tier, config={})
+    assert outcome.outcome_kind == "executed", outcome.error_message
+    assert outcome.telemetry["estopped"] is True
+    assert actuator._latched() is True
+    assert proto.set_position.call_count == 6       # every joint held
 
 
 def test_every_actuator_declares_a_read_tier_stop():

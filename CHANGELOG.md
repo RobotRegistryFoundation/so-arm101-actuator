@@ -8,6 +8,20 @@ exist while they shipped.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A tier refusal is a decision, not a fault.** When the caller's tier may not
+  invoke a tool (`REQUIRED_TIERS`), `execute` now returns `outcome_kind="denied"`
+  with the code `tool_tier`, like every other refusal in this driver. It
+  returned `"error"`, which robot-md-gateway records as an allowed call that
+  failed (decision `allow`, reason `ok`) and answers with HTTP 500. An
+  anonymous `arm.estop` therefore came back as a 500 on an allow record, and
+  nothing latched (review of robot-md-gateway#35, Q4). It is now a signed 403.
+  robot-md-gateway#35 records it as a deny; robot-md-gateway 0.5.0a9 still
+  writes `allow` on the record for every driver refusal. Nothing else changes:
+  the read tier and above may stop the arm, an anonymous caller may not, and a
+  refused stop latches nothing.
+
 ## [0.3.0] - 2026-10-22
 
 The first release since 0.2.2 (May 2026). It carries Cartesian control

@@ -48,6 +48,13 @@ The gateway invokes these by their ROBOT.md capability names:
 | `arm.move_to` | MANIPULATE | actuate, commission | `move_to` |
 | `arm.state` | OBSERVE | read, actuate, commission | `state` |
 | `status.report` | OBSERVE | read, actuate, commission | `read_state` |
+| `arm.estop` | SAFETY | read, actuate, commission | the stop: latch, then hold |
+| `arm.estop.clear` | SAFETY | commission | releases the latch |
+
+The driver checks the caller's tier against this column itself, whatever the
+envelope's `scope` says. A tier that is not listed is refused with a signed
+`403` (`tool_tier`) before anything reaches the bus: any bearer may stop the
+arm, and an anonymous caller may not.
 
 ## Cartesian control (v0.3.0+)
 
@@ -151,6 +158,7 @@ same thing as a sentence, and may be reworded:
 
 | `deny` | Meaning |
 |---|---|
+| `tool_tier` | the caller's tier may not invoke this tool (the Tiers column above); checked first, for every tool, and nothing reaches the bus |
 | `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1] |
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
 | `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
