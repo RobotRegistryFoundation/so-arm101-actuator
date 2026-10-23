@@ -389,11 +389,13 @@ MOTION_CAPABILITIES: frozenset[str] = frozenset({
 STOP_CAPABILITIES: frozenset[str] = frozenset({"arm.estop"})
 
 
-#: Minimum caller tiers per tool, enforced inside ``execute`` as defense in
-#: depth. The gateway's tier gate keys off the envelope's self-declared
-#: ``scope``, which the caller controls; these bindings key off the TOOL, which
-#: the operator controls via the allowlist. ``anon`` appears nowhere: an
-#: unauthenticated caller can neither move the arm nor read the servo bus.
+#: The caller tiers allowed to invoke each tool, enforced inside ``execute`` as
+#: defense in depth. Each is a set, not a minimum: a tier that is not listed is
+#: refused, however it ranks. The gateway's tier gate keys off the envelope's
+#: self-declared ``scope``, which the caller controls; these bindings key off
+#: the TOOL, which the operator controls via the allowlist. ``anon`` appears
+#: nowhere: an unauthenticated caller can neither move the arm nor read the
+#: servo bus.
 REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "arm.home": frozenset({"actuate", "commission"}),
     "arm.reach": frozenset({"actuate", "commission"}),
