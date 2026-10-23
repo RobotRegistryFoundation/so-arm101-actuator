@@ -56,10 +56,13 @@ envelope's `scope` says. A tier that is not listed is refused by the driver
 before anything reaches the bus, with a signed `403` whose `telemetry.deny` is
 `tool_tier`. A gateway that checks first answers with its own code instead
 (robot-md-gateway#35 refuses an anonymous `arm.estop` as `tier_policy`). Any
-bearer may stop the arm; an anonymous caller may not.
+bearer the gateway knows may stop the arm; an anonymous caller may not (the
+gateway treats a token it does not know as anonymous).
 
-Like every tool here, the stop reaches the arm only once the gateway's
-allowlist names it. Allowlist both stop tools and hold the clear to the
+Like every tool here, a caller's stop reaches the arm only once the gateway's
+allowlist names it. robot-md-gateway#35 also sends `arm.estop` itself when its
+safety monitor trips, whatever its allowlist says; robot-md-gateway 0.5.0a9
+sends no stop of its own. Allowlist both stop tools and hold the clear to the
 commission tier (the CHANGELOG's 0.3.0 upgrade note has the details):
 
 ```bash

@@ -19,10 +19,18 @@ published; its changes reach PyPI here too.
 
 `arm.estop` and `arm.estop.clear` are new to robot-md-gateway's `/v1/invoke`
 (see "The stop" below). The gateway refuses every tool its allowlist does not
-name, so a deployment upgraded from 0.2.2 has no stop until the operator adds
-both, and holds the clear to the commission tier, in the gateway's environment
-file (`gateway.env`). The gateway reads that file only at start, so restart it
-afterwards:
+name, so on a deployment upgraded from 0.2.2 no caller can stop the arm through
+`/v1/invoke` until the operator adds both, and holds the clear to the
+commission tier, in the gateway's environment file (`gateway.env`). Until then,
+what stops the arm depends on the gateway:
+
+- **robot-md-gateway 0.5.0a9** (PyPI) never sends a stop of its own, so
+  nothing stops the arm through the gateway.
+- **robot-md-gateway#35** sends `arm.estop` itself when its safety monitor
+  trips, whatever its allowlist says, so a trip still latches the arm. A
+  caller's `arm.estop` is still refused (`tool_allowlist`).
+
+The gateway reads `gateway.env` only at start, so restart it afterwards:
 
 ```bash
 ROBOT_MD_TOOL_ALLOWLIST="<the tools already listed>,arm.estop,arm.estop.clear"
@@ -35,6 +43,10 @@ driver holds the same line itself (`REQUIRED_TIERS`); with the second entry the
 gateway refuses a lower tier first, with its own signed 403. Keep the
 commission bearer out of every agent's configuration: it is what makes a
 stopped arm movable again.
+
+While the allowlist names any of the arm's motion tools and not `arm.estop`,
+both gateways log `allowlist_has_no_stop` at ERROR when they start. After the
+restart, check that the line is gone.
 
 ### The stop
 
@@ -59,7 +71,7 @@ stopped arm movable again.
 
 - **A tier refusal is a decision, not a fault.** When the caller's tier may not
   invoke a tool (`REQUIRED_TIERS`), `execute` now returns `outcome_kind="denied"`
-  with the code `tool_tier`, like every other refusal in this driver. The
+  with the code `tool_tier`, like every other refusal in `SOArm101Actuator`. The
   per-tool tier check (0.2.3, never published) returned `"error"`, which
   robot-md-gateway records as an allowed call that failed (decision `allow`,
   reason `ok`) and answers with HTTP 500. An anonymous `arm.estop` therefore
@@ -75,12 +87,15 @@ stopped arm movable again.
   allow record. It is now `bad_args`, a signed 403. Nothing reaches the bus,
   as before.
 
-Every refusal in this driver is now `denied`. What still returns `"error"` is
-not a refusal: a fault on the bus or in the actuator config, a hold that could
-not be sent (the latch stands), an `arm.reach_point` that ran and did not
-arrive, an unexpected exception, and a tool the driver does not implement
-(`unknown capability`), which an allowlist that names only implemented tools
-keeps out.
+Every refusal in `SOArm101Actuator` is now `denied`. What still returns
+`"error"` is not a refusal: a fault on the bus or in the actuator config, a
+hold that could not be sent (the latch stands), an `arm.reach_point` that ran
+and did not arrive, an unexpected exception, and a tool the driver does not
+implement (`unknown capability`), which an allowlist that names only
+implemented tools keeps out. The castor-hal adapter is not covered: it refuses
+every goal as `unsupported_goal` (see "castor-hal is optional"), and castor-hal
+0.2.0 still reports that as `"error"`, an HTTP 500 (castor-hal's own CHANGELOG
+lists it under "Known").
 
 ### castor-hal is optional
 
