@@ -52,9 +52,20 @@ The gateway invokes these by their ROBOT.md capability names:
 | `arm.estop.clear` | SAFETY | commission | releases the latch |
 
 The driver checks the caller's tier against this column itself, whatever the
-envelope's `scope` says. A tier that is not listed is refused with a signed
-`403` (`tool_tier`) before anything reaches the bus: any bearer may stop the
-arm, and an anonymous caller may not.
+envelope's `scope` says. A tier that is not listed is refused by the driver
+before anything reaches the bus, with a signed `403` whose `telemetry.deny` is
+`tool_tier`. A gateway that checks first answers with its own code instead
+(robot-md-gateway#35 refuses an anonymous `arm.estop` as `tier_policy`). Any
+bearer may stop the arm; an anonymous caller may not.
+
+Like every tool here, the stop reaches the arm only once the gateway's
+allowlist names it. Allowlist both stop tools and hold the clear to the
+commission tier (the CHANGELOG's 0.3.0 upgrade note has the details):
+
+```bash
+ROBOT_MD_TOOL_ALLOWLIST="...,arm.estop,arm.estop.clear"
+ROBOT_MD_TOOL_MIN_TIER="...,arm.estop.clear:commission"
+```
 
 ## Cartesian control (v0.3.0+)
 
