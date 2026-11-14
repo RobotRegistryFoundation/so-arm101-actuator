@@ -564,14 +564,21 @@ def test_a_trip_ends_a_paced_move_and_the_real_driver_holds(signed_manifest, mon
         assert moved["reached"] is False
         assert monitor.state is GatewayState.SAFE_STOP
 
-        # The gateway's own stop, once, executed by this driver. It is recorded
-        # after the driver returns, so its record means the hold has gone out.
-        assert _wait_for(lambda: _gateway_stops(chain)), "the gateway recorded no stop"
-        [stop] = _gateway_stops(chain)
-        assert stop.decision == "allow"
-        assert "sent arm.estop to so-arm101" in stop.decision_reason
-        assert stop.actuator_outcome_kind == "executed"
-        assert (stop.caller, stop.tier) == (None, None)
+        # The gateway's own stop, executed by this driver, and the same stop
+        # again once the move had returned and the first had answered
+        # (robot-md-gateway#35 sends it after every motion a trip overlapped).
+        # Each is recorded after the driver returns, so its record means its
+        # hold has gone out. The second finds no stop waiting for the bus, so
+        # it is not refused as busy: it is a stop repeated while latched.
+        assert _wait_for(lambda: len(_gateway_stops(chain)) >= 2), "fewer than two stops recorded"
+        stops = _gateway_stops(chain)
+        assert len(stops) == 2
+        assert sum(" again, because " in stop.decision_reason for stop in stops) == 1
+        for stop in stops:
+            assert stop.decision == "allow"
+            assert "sent arm.estop to so-arm101" in stop.decision_reason
+            assert stop.actuator_outcome_kind == "executed"
+            assert (stop.caller, stop.tier) == (None, None)
 
         # The hold went out after the move's last setpoint: every joint once,
         # the gripper included (arm.move_to never commands it), at the goals
@@ -590,7 +597,7 @@ def test_a_trip_ends_a_paced_move_and_the_real_driver_holds(signed_manifest, mon
         # run). Counted in setpoints streamed, not seconds: a process that
         # stalls streams nothing while it is stalled, so only a stop that comes
         # late to a live process can fail this.
-        setpoint_writes = writes[:-len(arm_config.JOINTS)]          # all but the hold
+        setpoint_writes = writes[:-2 * len(arm_config.JOINTS)]      # all but the two holds
         per = len({motor for motor, _ in setpoint_writes})          # joints per setpoint
         streamed = len(setpoint_writes) / per
         assert streamed < moved["motion"]["setpoints"] / 2, (streamed, moved["motion"])
