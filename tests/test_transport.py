@@ -157,7 +157,10 @@ def test_through_transport_actuator_motion_is_refused(tool_name, tool_args):
         config={},
     )
     assert out.success is False
-    assert out.outcome_kind == "error"
+    # castor-hal 0.1.1 reports an unsupported goal as a fault ("error");
+    # castor-hal with RobotRegistryFoundation/castor-hal#2 reports it as a
+    # refusal ("denied"). Either way nothing reaches the bus.
+    assert out.outcome_kind in ("error", "denied")
     assert out.telemetry["error_code"] == "unsupported_goal"
     proto.set_position.assert_not_called()
 

@@ -8,7 +8,7 @@ exist while they shipped.
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-23
+## [0.3.0] - 2026-11-14
 
 The first release since 0.2.2 (May 2026). It carries Cartesian control
 (September), the arm's stop through `/v1/invoke` (OC-04, September), what EV-03
@@ -26,7 +26,8 @@ what stops the arm depends on the gateway:
 
 - **robot-md-gateway 0.5.0a9** (PyPI) never sends a stop of its own, so
   nothing stops the arm through the gateway.
-- **robot-md-gateway#35** sends `arm.estop` itself when its safety monitor
+- **robot-md-gateway#35** (merged on 14 Nov 2026, so in the gateway's first
+  release after 0.5.0a9) sends `arm.estop` itself when its safety monitor
   trips, whatever its allowlist says, so a trip still latches the arm. A
   caller's `arm.estop` is still refused (`tool_allowlist`).
 
