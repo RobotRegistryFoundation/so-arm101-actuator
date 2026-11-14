@@ -238,20 +238,28 @@ def test_reached_agrees_with_the_positions_in_the_same_result():
     class ArrivesAfterTheLoopGivesUp:
         """Reports the old position while polled, the new one when finally read.
 
-        Switches on ELAPSED TIME rather than a read count, so it arrives in the
-        gap between the loop timing out and the closing snapshot regardless of
-        how many times the loop happens to poll.
+        Arrives on the first read once `timeout_s` has passed since the first
+        set_position. The move's poll loop runs for `timeout_s` from just
+        before that command, so the loop's deadline and the arrival are apart
+        only by the time between the loop starting its clock and the first
+        set_position, not by how long the loop's sleeps run. Timed from when
+        the fixture was built, the arrival came after the closing snapshot
+        whenever a sleep ran long.
         """
 
-        def __init__(self, target_ticks: int, arrive_after_s: float):
+        def __init__(self, target_ticks: int, timeout_s: float):
             self._target = target_ticks
-            self._arrive_at = time.monotonic() + arrive_after_s
+            self._timeout_s = timeout_s
+            self._first_set: float | None = None
 
         def set_position(self, motor_id, ticks):
-            pass
+            if self._first_set is None:
+                self._first_set = time.monotonic()
 
         def read_position(self, motor_id):
-            return self._target if time.monotonic() >= self._arrive_at else 2048
+            arrived = (self._first_set is not None
+                       and time.monotonic() - self._first_set >= self._timeout_s)
+            return self._target if arrived else 2048
 
         def read_temperature(self, motor_id):
             return 30
@@ -259,11 +267,12 @@ def test_reached_agrees_with_the_positions_in_the_same_result():
     from so_arm101_actuator import config as cfg
     target_rad = 0.30
     target_ticks = cfg.rad_to_ticks("wrist_flex", target_rad)
-    # Arrive just after the 0.25s loop gives up, i.e. inside the gap.
+    timeout_s = 0.25
+    # Arrive once the loop has given up, i.e. inside the gap.
     actuator = SOArm101Actuator(
-        protocol=ArrivesAfterTheLoopGivesUp(target_ticks, arrive_after_s=0.26))
+        protocol=ArrivesAfterTheLoopGivesUp(target_ticks, timeout_s=timeout_s))
 
-    result = actuator.move({"wrist_flex": target_rad}, timeout_s=0.25)
+    result = actuator.move({"wrist_flex": target_rad}, timeout_s=timeout_s)
 
     on_target = abs(result["final_positions"]["wrist_flex"] - target_rad)
     assert on_target <= actuator.move_tolerance_rad, "test fixture did not actually arrive"
