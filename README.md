@@ -48,6 +48,27 @@ The gateway invokes these by their ROBOT.md capability names:
 | `arm.move_to` | MANIPULATE | actuate, commission | `move_to` |
 | `arm.state` | OBSERVE | read, actuate, commission | `state` |
 | `status.report` | OBSERVE | read, actuate, commission | `read_state` |
+| `arm.estop` | SAFETY | read, actuate, commission | the stop: latch, then hold |
+| `arm.estop.clear` | SAFETY | commission | releases the latch |
+
+The driver checks the caller's tier against this column itself, whatever the
+envelope's `scope` says. A tier that is not listed is refused by the driver
+before anything reaches the bus, with a signed `403` whose `telemetry.deny` is
+`tool_tier`. A gateway that checks first answers with its own code instead
+(robot-md-gateway#35 refuses an anonymous `arm.estop` as `tier_policy`). Any
+bearer the gateway knows may stop the arm; an anonymous caller may not (the
+gateway treats a token it does not know as anonymous).
+
+Like every tool here, a caller's stop reaches the arm only once the gateway's
+allowlist names it. robot-md-gateway#35 also sends `arm.estop` itself when its
+safety monitor trips, whatever its allowlist says; robot-md-gateway 0.5.0a9
+sends no stop of its own. Allowlist both stop tools and hold the clear to the
+commission tier (the CHANGELOG's 0.3.0 upgrade note has the details):
+
+```bash
+ROBOT_MD_TOOL_ALLOWLIST="...,arm.estop,arm.estop.clear"
+ROBOT_MD_TOOL_MIN_TIER="...,arm.estop.clear:commission"
+```
 
 ## Cartesian control (v0.3.0+)
 
@@ -151,7 +172,8 @@ same thing as a sentence, and may be reworded:
 
 | `deny` | Meaning |
 |---|---|
-| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1] |
+| `tool_tier` | the caller's tier may not invoke this tool (the Tiers column above); checked first, for every tool, and nothing reaches the bus |
+| `bad_args` | missing/non-numeric coordinate, unknown argument, or `speed` not a finite number in (0, 1]; for `arm.reach`, a `target` other than `ready` |
 | `out_of_workspace` | outside `physics.workspace.bounds_mm` |
 | `path_leaves_workspace` | the line from where the arm is held to the target comes within the margin of a face, or past it (see below) |
 | `too_slow` | `speed` so small the move would take longer than 60 s |

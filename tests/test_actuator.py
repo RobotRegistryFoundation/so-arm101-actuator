@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from so_arm101_actuator.actuator import SOArm101Actuator
+from so_arm101_actuator.actuator import REQUIRED_TIERS, SOArm101Actuator
 from so_arm101_actuator.errors import OutOfRangeError, UnknownJointError
 
 
@@ -238,20 +238,28 @@ def test_reached_agrees_with_the_positions_in_the_same_result():
     class ArrivesAfterTheLoopGivesUp:
         """Reports the old position while polled, the new one when finally read.
 
-        Switches on ELAPSED TIME rather than a read count, so it arrives in the
-        gap between the loop timing out and the closing snapshot regardless of
-        how many times the loop happens to poll.
+        Arrives on the first read once `timeout_s` has passed since the first
+        set_position. The move's poll loop runs for `timeout_s` from just
+        before that command, so the loop's deadline and the arrival are apart
+        only by the time between the loop starting its clock and the first
+        set_position, not by how long the loop's sleeps run. Timed from when
+        the fixture was built, the arrival came after the closing snapshot
+        whenever a sleep ran long.
         """
 
-        def __init__(self, target_ticks: int, arrive_after_s: float):
+        def __init__(self, target_ticks: int, timeout_s: float):
             self._target = target_ticks
-            self._arrive_at = time.monotonic() + arrive_after_s
+            self._timeout_s = timeout_s
+            self._first_set: float | None = None
 
         def set_position(self, motor_id, ticks):
-            pass
+            if self._first_set is None:
+                self._first_set = time.monotonic()
 
         def read_position(self, motor_id):
-            return self._target if time.monotonic() >= self._arrive_at else 2048
+            arrived = (self._first_set is not None
+                       and time.monotonic() - self._first_set >= self._timeout_s)
+            return self._target if arrived else 2048
 
         def read_temperature(self, motor_id):
             return 30
@@ -259,11 +267,12 @@ def test_reached_agrees_with_the_positions_in_the_same_result():
     from so_arm101_actuator import config as cfg
     target_rad = 0.30
     target_ticks = cfg.rad_to_ticks("wrist_flex", target_rad)
-    # Arrive just after the 0.25s loop gives up, i.e. inside the gap.
+    timeout_s = 0.25
+    # Arrive once the loop has given up, i.e. inside the gap.
     actuator = SOArm101Actuator(
-        protocol=ArrivesAfterTheLoopGivesUp(target_ticks, arrive_after_s=0.26))
+        protocol=ArrivesAfterTheLoopGivesUp(target_ticks, timeout_s=timeout_s))
 
-    result = actuator.move({"wrist_flex": target_rad}, timeout_s=0.25)
+    result = actuator.move({"wrist_flex": target_rad}, timeout_s=timeout_s)
 
     on_target = abs(result["final_positions"]["wrist_flex"] - target_rad)
     assert on_target <= actuator.move_tolerance_rad, "test fixture did not actually arrive"
@@ -481,6 +490,84 @@ def test_estop_clear_is_refused_below_commission_and_works_at_commission(fake_cl
         envelope={"msg_id": "m-4", "tool_name": "arm.home", "tool_args": {}},
         manifest_path="", tier="actuate", config={})
     assert moved.outcome_kind == "executed"
+
+
+# --- a tier refusal is a decision -------------------------------------------
+#
+# robot-md-gateway turns `denied` into a signed 403 (recorded as a deny from
+# robot-md-gateway#35 on), and any other unsuccessful outcome into a 500
+# recorded as an allowed call that failed (decision "allow", reason "ok"). The
+# tier refusal used to be `error`, so an anonymous arm.estop came back through
+# the gateway as a 500 on an allow record (review of robot-md-gateway#35, Q4).
+
+#: Every (tool, tier) pair REQUIRED_TIERS refuses, over the three bearer tiers,
+#: the gateway's anonymous fallback, and a tier this driver has never heard of.
+_TIER_REFUSALS = [
+    (tool, tier)
+    for tool, allowed in sorted(REQUIRED_TIERS.items())
+    for tier in ("anon", "read", "actuate", "commission", "not-a-tier")
+    if tier not in allowed
+]
+
+
+@pytest.mark.parametrize("tool_name,tier", _TIER_REFUSALS)
+def test_a_tier_refusal_is_denied_not_an_error(tool_name, tier):
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(
+        envelope={"msg_id": "m-tier", "tool_name": tool_name, "tool_args": {}},
+        manifest_path="", tier=tier, config={})
+
+    assert outcome.success is False
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "tool_tier"
+    assert repr(tier) in outcome.telemetry["reason"]
+    assert repr(tool_name) in outcome.telemetry["reason"]
+    assert outcome.error_message.startswith("tool_tier: ")
+    # Refused before anything else: no servo traffic at all, and no latch. A
+    # refused stop is not a stop.
+    assert proto.method_calls == []
+    assert actuator._latched() is False
+
+
+def test_the_refusals_cover_the_stop_and_the_clear():
+    """The two pairs the review reproduced are among the parametrized cases, so
+    the test above cannot pass by having nothing to check."""
+    assert ("arm.estop", "anon") in _TIER_REFUSALS
+    assert ("arm.estop.clear", "read") in _TIER_REFUSALS
+    assert ("arm.estop.clear", "actuate") in _TIER_REFUSALS
+
+
+@pytest.mark.parametrize("target", ["nowhere", "READY", "", None, 3, ["ready"]])
+def test_an_unknown_reach_target_is_a_refusal_not_a_fault(target):
+    """arm.reach knows one target, "ready". Any other is a bad argument,
+    refused before the bus like the rest. It was an `error` (HTTP 500 on an
+    allow record), the same class of fault as the tier refusal (review of
+    so-arm101-actuator#9, finding 2)."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(
+        envelope={"msg_id": "m-reach", "tool_name": "arm.reach", "tool_args": {"target": target}},
+        manifest_path="", tier="actuate", config={})
+
+    assert outcome.success is False
+    assert outcome.outcome_kind == "denied"
+    assert outcome.telemetry["deny"] == "bad_args"
+    assert repr(target) in outcome.telemetry["reason"]
+    assert proto.method_calls == []
+
+
+@pytest.mark.parametrize("tier", ["read", "actuate", "commission"])
+def test_arm_estop_is_accepted_at_every_bearer_tier(tier):
+    """The other side of the refusal: every tier a bearer can hold may stop the
+    arm. The read tier on purpose (REQUIRED_TIERS): the runtime process holds
+    only the read bearer, and robot-md-gateway#35 sends the gateway's own stop
+    at the read tier."""
+    actuator, proto = _make_actuator(present_positions={i: 2048 for i in range(1, 7)})
+    outcome = actuator.execute(envelope=_estop_env("arm.estop"), manifest_path="",
+                               tier=tier, config={})
+    assert outcome.outcome_kind == "executed", outcome.error_message
+    assert outcome.telemetry["estopped"] is True
+    assert actuator._latched() is True
+    assert proto.set_position.call_count == 6       # every joint held
 
 
 def test_every_actuator_declares_a_read_tier_stop():
