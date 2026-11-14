@@ -580,13 +580,15 @@ def test_a_trip_ends_a_paced_move_and_the_real_driver_holds(signed_manifest, mon
             assert stop.actuator_outcome_kind == "executed"
             assert (stop.caller, stop.tier) == (None, None)
 
-        # The hold went out after the move's last setpoint: every joint once,
-        # the gripper included (arm.move_to never commands it), at the goals
-        # the latch chose. Nothing has written to the bus since.
+        # Both holds went out after the move's last setpoint, each writing
+        # every joint once, the gripper included (arm.move_to never commands
+        # it), at the goals the latch chose: the second, a stop repeated while
+        # latched, writes the first's goals again. Nothing has written to the
+        # bus since.
         assert arm._latched() is True
         held = dict(arm._held)
         assert set(held) == set(arm_config.JOINTS)
-        assert sorted(writes[-6:]) == _motors(held)
+        assert sorted(writes[-12:-6]) == sorted(writes[-6:]) == _motors(held)
         assert sorted(state.items()) == _motors(held)
         hold_writes = len(writes)
         time.sleep(0.3)
