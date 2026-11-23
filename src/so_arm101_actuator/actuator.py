@@ -304,7 +304,7 @@ def _bus(timeout_s: float, *, stop: bool = False):
 #: would turn a clean signed DENY into a confusing actuator 500.
 IMPLEMENTED_CAPABILITIES: frozenset[str] = frozenset({
     "arm.home", "arm.reach", "status.report", "arm.reach_point",
-    "arm.move_to", "arm.state",
+    "arm.move_to", "arm.state", "arm.grip",
     # The stop was written and tested in transport.py long before anything could
     # reach it: it appeared in no capability list, no tier table and no dispatch
     # branch, so the deployed allowlist for this arm had no stop tool of any
@@ -342,7 +342,7 @@ TOOL_DESCRIPTIONS: dict[str, str] = {
 #: than inferred from the name, so the gateway can check at startup that an
 #: allowlist carrying motion also carries a stop (``allowlist_has_no_stop``).
 MOTION_CAPABILITIES: frozenset[str] = frozenset({
-    "arm.home", "arm.reach", "arm.reach_point", "arm.move_to",
+    "arm.home", "arm.reach", "arm.reach_point", "arm.move_to", "arm.grip",
     "move", "home", "move_to",
 })
 STOP_CAPABILITIES: frozenset[str] = frozenset({"arm.estop"})
@@ -356,6 +356,7 @@ STOP_CAPABILITIES: frozenset[str] = frozenset({"arm.estop"})
 REQUIRED_TIERS: dict[str, frozenset[str]] = {
     "arm.home": frozenset({"actuate", "commission"}),
     "arm.reach": frozenset({"actuate", "commission"}),
+    "arm.grip": frozenset({"actuate", "commission"}),
     "move": frozenset({"actuate", "commission"}),
     "home": frozenset({"actuate", "commission"}),
     "status.report": frozenset({"read", "actuate", "commission"}),
@@ -1334,20 +1335,38 @@ class SOArm101Actuator:
         """
         positions: dict[str, float] = {}
         temps: dict[str, float] = {}
+        loads: dict[str, int] = {}
+        voltages: dict[str, float] = {}
         for joint in config.JOINTS:
+            mid = config.JOINTS[joint]["motor_id"]
             positions[joint] = self._read_joint(joint)
             try:
                 temps[joint] = float(self._protocol.read_temperature(
-                    motor_id=config.JOINTS[joint]["motor_id"],
+                    motor_id=mid,
                 ))
             except (IOError, OSError):
                 # Best-effort — joints without a temp sensor are simply omitted.
                 pass
-        return ActuatorState(
-            positions=positions,
-            motor_temps_c=temps,
-            timestamp_s=time.monotonic(),
-        )
+            if hasattr(self._protocol, "read_load"):
+                try:
+                    loads[joint] = int(self._protocol.read_load(motor_id=mid))
+                except (IOError, OSError, Exception):
+                    pass
+            if hasattr(self._protocol, "read_voltage"):
+                try:
+                    voltages[joint] = float(self._protocol.read_voltage(motor_id=mid))
+                except (IOError, OSError, Exception):
+                    pass
+        out: dict = {
+            "positions": positions,
+            "motor_temps_c": temps,
+            "timestamp_s": time.monotonic(),
+        }
+        if loads:
+            out["motor_loads"] = loads
+        if voltages:
+            out["motor_voltages_v"] = voltages
+        return out  # type: ignore[return-value]
 
     def _settle(self, commanded: dict[str, float], *, still_rad: float = 0.003,
                 min_dwell_s: float = 0.35, max_wait_s: float = 1.0, poll_s: float = 0.06) -> None:
@@ -1643,6 +1662,31 @@ class SOArm101Actuator:
             # Derived from the taught pose, not taught itself: it gets no
             # allowance for sitting inside the margin.
             tool_name, tool_args = "move", {"joint_positions": reach_pose}
+        elif tool_name == "arm.grip":
+            if not self._gripper_calibrated:
+                return _denied(DeniedError(
+                    "gripper_uncalibrated",
+                    "manifest must declare gripper zero_pose_steps, open_steps, and close_steps",
+                ))
+            lo, hi = config.SAFE_RANGE_RAD.get("gripper", (-0.5, 0.5))
+            action = tool_args.get("action", tool_args.get("state", "open"))
+            fraction = tool_args.get("fraction")
+            if fraction is not None:
+                if isinstance(fraction, bool) or not isinstance(fraction, (int, float)) or not (0.0 <= float(fraction) <= 1.0):
+                    return _denied(DeniedError("bad_args", "arm.grip fraction must be a number in [0.0, 1.0]"))
+                target_rad = lo + float(fraction) * (hi - lo)
+            elif action in ("open", "release"):
+                target_rad = hi
+            elif action in ("close", "grip", "grasp"):
+                target_rad = lo
+            elif action in ("half", "mid"):
+                target_rad = 0.5 * (lo + hi)
+            else:
+                return _denied(DeniedError(
+                    "bad_args",
+                    f"arm.grip action must be 'open', 'close', 'half', or fraction in [0.0, 1.0]; got {action!r}",
+                ))
+            tool_name, tool_args = "move", {"joint_positions": {"gripper": target_rad}}
         if tool_name == "move":
             # Every joint move the gateway can ask for (arm.home, arm.reach, a
             # bare `move`) is checked against the workspace and paced, exactly

@@ -21,6 +21,8 @@ def _build_packet(motor_id: int, instruction: int, params: bytes) -> bytes:
 SCS_REG_GOAL_POSITION = 0x2A
 SCS_INST_WRITE_DATA = 0x03
 SCS_REG_PRESENT_POSITION = 0x38
+SCS_REG_PRESENT_LOAD = 0x3C
+SCS_REG_PRESENT_VOLTAGE = 0x3E
 SCS_INST_READ_DATA = 0x02
 SCS_REG_PRESENT_TEMPERATURE = 0x3F
 SCS_INST_PING = 0x01
@@ -149,6 +151,39 @@ class SCSProtocol:
         self._serial.write(pkt)
         # 1-byte data → 7-byte status
         return self._read_status(motor_id, 1, what="Present_Temperature")[0]
+
+    def read_load(self, motor_id: int) -> int:
+        """Read Present_Load (2 bytes, reg 0x3C) from `motor_id`.
+
+        Bit 10 is direction (1 = CCW, 0 = CW), bits 0..9 are magnitude 0..1000
+        (0..100.0% duty cycle). Returns signed load in [-1000, +1000].
+        """
+        params = bytes([SCS_REG_PRESENT_LOAD, 0x02])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_READ_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        lo, hi = self._read_status(motor_id, 2, what="Present_Load")
+        raw = lo | (hi << 8)
+        mag = raw & 0x03FF
+        return -mag if (raw & 0x0400) else mag
+
+    def read_voltage(self, motor_id: int) -> float:
+        """Read Present_Voltage (1 byte, reg 0x3E) from `motor_id`.
+
+        STS3215 reports voltage in 0.1 V units (e.g., 74 = 7.4 V).
+        """
+        params = bytes([SCS_REG_PRESENT_VOLTAGE, 0x01])
+        pkt = _build_packet(
+            motor_id=motor_id,
+            instruction=SCS_INST_READ_DATA,
+            params=params,
+        )
+        self._serial.write(pkt)
+        raw = self._read_status(motor_id, 1, what="Present_Voltage")[0]
+        return round(raw * 0.1, 2)
 
     def ping(self, motor_id: int) -> bool:
         """Send a PING to `motor_id`. Returns True if a response is received."""
