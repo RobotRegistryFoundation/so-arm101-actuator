@@ -1668,7 +1668,7 @@ class SOArm101Actuator:
                     "gripper_uncalibrated",
                     "manifest must declare gripper zero_pose_steps, open_steps, and close_steps",
                 ))
-            lo, hi = config.SAFE_RANGE_RAD.get("gripper", (-0.5, 0.5))
+            lo, hi = _config_module.SAFE_RANGE_RAD.get("gripper", (-0.5, 0.5))
             action = tool_args.get("action", tool_args.get("state", "open"))
             fraction = tool_args.get("fraction")
             if fraction is not None:
